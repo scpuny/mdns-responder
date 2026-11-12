@@ -1,0 +1,23 @@
+# 运行态产物（日志、PID、备份）
+logs/*
+!logs/.gitkeep
+*.log
+config.toml.bak
+*.user-backup-*
+
+# 实际运行配置（含本机 IP / token，不入库；模板 config.example.toml 已入库）
+config.toml
+
+# Python 字节码 / 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 前端临时校验产物
+.js_check.js
+*.tmp
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store

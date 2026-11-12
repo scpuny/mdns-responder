@@ -1,0 +1,119 @@
+# =============================================================================
+# mDNS Responder 配置模板（复制为 config.toml 后按实际环境修改）
+# 修改 config.toml 后无需重启：服务会自动检测 mtime 变化并热重载，也可 kill -HUP <pid>
+# 校验配置（不启动网络）：
+#   python3 src/mdns_responder.py -c config.toml --check
+#   ./start.sh --check
+# =============================================================================
+
+[server]
+# 组播使用的网卡：
+#   "0.0.0.0"      -> 内核按默认路由选择（推荐，占绝大多数场景）
+#   "192.168.1.10" -> 仅在该网卡上收发
+#   "all"          -> 枚举本机全部非回环 IPv4 接口，逐一加入组播并发送
+interface = "0.0.0.0"
+
+# mDNS 组播地址与端口，标准为 224.0.0.251:5353
+# 如需与系统 avahi / systemd-resolved 隔离做测试，可改端口（客户端也需同端口）
+group = "224.0.0.251"
+port = 5353
+
+# 记录 TTL（秒）。120s 是 RFC 6762 对 A 记录的常用值
+ttl = 120
+
+# 周期性主动宣告间隔（秒），0 表示关闭周期宣告（仍会做启动时宣告）
+announce_interval = 60
+
+# 启动时连续宣告次数（每次间隔 1 秒），用于快速刷新局域网缓存；0 = 不宣告
+announce_count = 3
+
+# 是否发布 IPv4 反查 PTR（<反序IP>.in-addr.arpa -> 域名），便于 avahi 等做地址反解
+reverse_ptr = true
+
+# ---- Web 管理控制台（web/admin.html）----
+# 启动后浏览器打开 http://127.0.0.1:8765/ ，可改配置并即时热重载、看记录/日志、发探针
+# 默认只监听回环地址，安全；如需远程访问请改 management_host 并务必设置 token
+management = true
+management_host = "127.0.0.1"
+management_port = 8765
+management_token = ""
+
+# ---- 有界文件日志（防止长期运行撑爆磁盘）----
+# log_file 相对项目根目录；留空 "" 则完全不写文件（仅控制台 + 管理页面 SSE 日志）
+# 轮转策略：单文件达到 log_max_bytes 即归档为 .1/.2...，最多保留
+#           log_backup_count 份历史，超出自动删除最老文件（循环写）
+#           log_retention_days > 0 时额外删除 mtime 超过 N 天的历史文件（自动过期）
+# 磁盘占用硬上界 = log_max_bytes × (log_backup_count + 1) = 10MiB × 6 = 60MiB
+# 注意 1：日志由 Python 内部轮转，勿再用 shell >> 或 systemd append 重定向到同一文件（会双写）
+# 注意 2：修改本段 log_* 后需重启进程才生效；其余配置仍支持 mtime 热重载
+log_file = "logs/mdns.log"
+log_max_bytes = 10485760
+log_backup_count = 5
+log_retention_days = 7
+log_console = true
+
+# -----------------------------------------------------------------------------
+# 可观测增强（mdns_insights）—— 默认全部开启，热重载即时生效
+#
+#   健康监控    周期 TCP 探测已登记的 host（80）/ service（ip:port），
+#               管理台「健康监控」页出红绿状态灯
+#   查询审计    谁在查什么、命中与否，有界环形缓冲，管理台「查询审计」页查看
+#   局域网浏览  摄取局域网内其它 mDNS/DNS-SD 应答 + 周期枚举，形成服务地图
+#   名称冲突    本地同名异值的外来记录（RFC 6762 §4 防御观测）
+# -----------------------------------------------------------------------------
+
+# 健康监控：周期 TCP 探测已登记目标（0 = 关闭探测）
+health = true
+health_interval = 30        # 探测周期（秒）
+health_timeout = 2.0        # 单次探测超时（0.1..30 秒）
+
+# 查询审计：环形缓冲保留最近 N 条（>=10）
+audit = true
+audit_limit = 500
+
+# 局域网服务浏览：被动摄取外来应答 + 周期主动枚举
+browse = true
+browse_scan_interval = 45   # 主动枚举周期（秒），0 = 仅被动摄取
+browse_limit = 400          # 服务地图保留实例数
+
+# 名称冲突检测：外来应答中本地同名异值记录登记为冲突
+conflict_detect = true
+
+
+# -----------------------------------------------------------------------------
+# 纯域名 -> IP 映射（生成 A 记录；写 IPv6 地址则生成 AAAA 记录）
+# -----------------------------------------------------------------------------
+[[hosts]]
+name = "nas.local"
+ip = "172.15.103.30"
+
+[[hosts]]
+name = "camera.local"
+ip = "172.15.103.31"
+
+
+# -----------------------------------------------------------------------------
+# 服务发现映射：域名（服务实例）+ IP + 端口
+# 每条 service 自动发布 4 类记录：
+#   PTR  <type>.                     -> <instance>.<type>.
+#   SRV  <instance>.<type>.         -> 0 0 <port> <host>.
+#   TXT  <instance>.<type>.         -> txt 中的键值对
+#   A/AAAA <host>.                  -> <ip>
+# 并且应答 PTR/SRV/TXT 查询时会把 SRV/TXT/A 作为附加记录一并返回（一次往返拿全）
+#
+# host 可显式指定为 SRV target / A 记录名；省略时由实例名自动派生 <slug>.local。
+# -----------------------------------------------------------------------------
+[[services]]
+type = "_http._tcp.local"          # 服务类型，标准形式 _xxx._tcp.local / _xxx._udp.local
+instance = "Office Web"            # 实例名（不能含 '.'，空格与中文可用）
+host = "nas.local"                 # 可省略，省略时由实例名自动生成 <slug>.local
+ip = "172.15.103.30"               # 该服务实际所在 IP
+port = 8080                        # 该服务实际端口
+txt = { path = "/", version = "1.0" }
+
+[[services]]
+type = "_eam._tcp.local"
+instance = "Hermes EAM"
+ip = "172.15.103.30"
+port = 18080
+txt = { module = "measure", env = "dev" }

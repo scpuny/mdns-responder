@@ -1,0 +1,26 @@
+[Unit]
+Description=Configurable mDNS / DNS-SD Responder with Web Admin Console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mdns
+Group=mdns
+WorkingDirectory=/opt/mdns-responder
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/mdns-responder/src/mdns_responder.py -c /opt/mdns-responder/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=3
+# mDNS 使用 5353（>1024），无需 CAP_NET_BIND_SERVICE；保留 CAP_NET_RAW 便于多网卡原始套接字场景
+AmbientCapabilities=CAP_NET_RAW
+NoNewPrivileges=true
+# 文件日志由 Python 内部有界轮转（config.toml [server].log_*），
+# 此处不再 append 重定向，否则会双写且绕过轮转导致磁盘无限增长。
+# 控制台输出默认进 journald（journald 自带轮转策略）。
+
+[Install]
+WantedBy=multi-user.target
