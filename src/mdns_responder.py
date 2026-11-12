@@ -304,6 +304,12 @@ class ServerConfig:
     management_host: str = "127.0.0.1"
     management_port: int = 8765
     management_token: str = ""
+    # HTTP 网关（默认 80）：按 Host 头把域名反代到 services/hosts 登记的目标，
+    # 同时把管理台收编进 80（访问 gateway_admin_host 即控制台），实现「域名直达端口」。
+    gateway: bool = False
+    gateway_port: int = 80
+    gateway_admin_host: str = "mdns.local"
+    gateway_timeout: float = 6.0
     # 有界文件日志（相对项目根；循环写 + 自动删除最老 + 可选按天过期）
     log_file: str = "logs/mdns.log"
     log_max_bytes: int = 10 * 1024 * 1024
@@ -354,6 +360,16 @@ class ServerConfig:
         if (not self.management_token
                 and self.management_host not in ("127.0.0.1", "localhost", "::1")):
             LOG.warning("管理接口监听在非回环地址且未设置 token，建议配置 management_token")
+        # 网关（Host 头反代 + 管理台收编）
+        if self.gateway:
+            if not 1 <= self.gateway_port <= 65535:
+                raise ConfigError("server.gateway_port 必须在 1..65535")
+            if self.gateway_port == self.port:
+                raise ConfigError("server.gateway_port 不能与 mDNS 端口相同")
+            if self.gateway_port == self.management_port:
+                raise ConfigError("server.gateway_port 不能与 management_port 相同")
+            if not self.gateway_admin_host.strip():
+                LOG.warning("gateway_admin_host 为空：管理台将仅能通过本机 IP 或 /admin 访问")
         if self.health_interval < 0:
             raise ConfigError("server.health_interval 必须 >= 0（0 = 关闭探测）")
         if self.health_timeout < 0.1 or self.health_timeout > 30:
@@ -400,6 +416,9 @@ class ServiceEntry:
     port: int
     host: str | None = None
     txt: dict[str, str] = field(default_factory=dict)
+    # 是否经 HTTP 网关（Host 头反代）可达：默认开启，保持向后兼容；
+    # 设为 false 仍正常广播 DNS-SD，但网关不再反代该域名（常用于远程/非 HTTP 设备）。
+    proxy: bool = True
 
 
 @dataclass
@@ -493,6 +512,13 @@ def load_config(path: str) -> Config:
                                 "server.management_port"),
         management_token=_as_str(server_raw.get("management_token", ""),
                                  "server.management_token"),
+        gateway=_as_bool(server_raw.get("gateway", False), "server.gateway"),
+        gateway_port=_as_int(server_raw.get("gateway_port", 80),
+                            "server.gateway_port"),
+        gateway_admin_host=_as_str(server_raw.get("gateway_admin_host", "mdns.local"),
+                                   "server.gateway_admin_host"),
+        gateway_timeout=_as_float(server_raw.get("gateway_timeout", 6.0),
+                                  "server.gateway_timeout"),
         log_file=_as_str(server_raw.get("log_file", "logs/mdns.log"),
                          "server.log_file"),
         log_max_bytes=_as_int(server_raw.get("log_max_bytes", 10 * 1024 * 1024),
@@ -571,7 +597,8 @@ def load_config(path: str) -> Config:
             raise ConfigError(f"services[{idx}].txt 必须是表")
         txt = {str(k): ("1" if v is True else "0" if v is False else str(v))
                for k, v in txt_raw.items()}
-        services.append(ServiceEntry(svc_type, instance, ip, port, host, txt))
+        proxy = _as_bool(item.get("proxy", True), f"services[{idx}].proxy")
+        services.append(ServiceEntry(svc_type, instance, ip, port, host, txt, proxy))
 
     if not hosts and not services:
         raise ConfigError("配置中没有任何 hosts 或 services，服务不会发布任何记录")
@@ -960,6 +987,7 @@ class Responder:
         self.started_at = time.time()
         self.stats = {"queries": 0, "responses": 0, "bytes": 0, "announces": 0}
         self.admin = None
+        self.gateway = None
         # 可观测增强：查询审计 / 局域网浏览 / 冲突检测（mdns_insights）
         from mdns_insights import BrowseState, ConflictState, HealthMonitor, QueryAudit
         srv = self.cfg.server
@@ -1180,6 +1208,12 @@ class Responder:
                     "management": srv.management, "management_host": srv.management_host,
                     "management_port": srv.management_port,
                     "management_token": srv.management_token,
+                    # HTTP 网关：缺了这些字段，前端表单会把空值当 0 提交，
+                    # 开启网关时立刻触发 "gateway_port 必须在 1..65535"。
+                    "gateway": srv.gateway,
+                    "gateway_port": srv.gateway_port,
+                    "gateway_admin_host": srv.gateway_admin_host,
+                    "gateway_timeout": srv.gateway_timeout,
                     "log_file": srv.log_file, "log_max_bytes": srv.log_max_bytes,
                     "log_backup_count": srv.log_backup_count,
                     "log_retention_days": srv.log_retention_days,
@@ -1201,6 +1235,8 @@ class Responder:
                 "services": [{
                     "type": s.type, "instance": s.instance, "host": s.host or "",
                     "ip": s.ip, "port": s.port, "txt": dict(s.txt),
+                    # 必须回显 proxy，否则界面永远把开关显示成"开"，刷新即还原。
+                    "proxy": s.proxy,
                 } for s in self.cfg.services],
             },
         }
@@ -1398,6 +1434,7 @@ class Responder:
         self._refresh_local_values()
         self._refresh_browse_scan()
         self._sync_health_thread()
+        self._sync_gateway()           # 网关开关 / 端口 / 域名 / 超时热更新，无需重启
         self.alerts.configure(
             webhooks=new_cfg.server.alert_webhooks,
             enabled=new_cfg.server.alert,
@@ -1420,6 +1457,47 @@ class Responder:
             self.health.start()
         elif not srv.health and self.health is not None and self.health.is_alive():
             self.health.stop()
+
+    def _sync_gateway(self) -> None:
+        """让运行中的 HTTP 网关与当前配置保持一致（无需重启进程）。
+
+        这是修复「界面关了网关开关、80 端口却仍被占用」的关键：网关在启动时
+        一次性拉起、原本只在进程退出时停止，热重载不会碰它。这里按配置 reconciliation：
+          - 配置关闭但网关仍在跑              -> 停止网关，释放 80；
+          - 配置开启但网关未起                -> 启动网关；
+          - 网关在跑但端口/管理台域名/超时变了   -> 重建 socket；
+          - 其余在跑的情况                    -> 仅就地更新超时，无需重建。
+        """
+        from admin_server import install_logging, start_gateway, stop_admin
+        srv = self.cfg.server
+        want = bool(srv.gateway)
+        running = self.gateway is not None
+        if running:
+            g = self.gateway
+            port = g.server_address[1]
+            admin_host = (g.gateway_admin_host or "").strip().lower()
+            timeout = float(getattr(g, "gateway_timeout", 6.0))
+            need_rebuild = (
+                port != srv.gateway_port
+                or admin_host != (srv.gateway_admin_host or "").strip().lower()
+                or timeout != float(srv.gateway_timeout or 6.0)
+            )
+            if not want:
+                LOG.info("配置关闭 HTTP 网关，停止网关（释放端口 %d）", port)
+                stop_admin(self.gateway)
+                self.gateway = None
+                return
+            if need_rebuild:
+                LOG.info("网关参数变化（端口/域名/超时），重建网关 socket")
+                stop_admin(self.gateway)
+                self.gateway = start_gateway(self, log_handler=install_logging(srv))
+            else:
+                g.gateway_timeout = float(srv.gateway_timeout or 6.0)
+            return
+        # 当前未运行
+        if want:
+            LOG.info("配置开启 HTTP 网关，启动网关")
+            self.gateway = start_gateway(self, log_handler=install_logging(srv))
 
     def _announce(self, goodbye: bool = False) -> None:
         packet = build_announce(self.records, ttl=0 if goodbye else None)
@@ -1538,9 +1616,10 @@ class Responder:
         if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, self._on_hup)
 
-        from admin_server import install_logging, start_admin, stop_admin
+        from admin_server import install_logging, start_admin, start_gateway, stop_admin
         log_handler = install_logging(self.cfg.server)
         self.admin = start_admin(self, log_handler=log_handler)
+        self.gateway = start_gateway(self, log_handler=log_handler)
         self._sync_health_thread()
         LOG.info("mDNS responder 已启动 (pid=%d)", os.getpid())
         last_housekeeping = time.monotonic()
@@ -1592,6 +1671,7 @@ class Responder:
             self._announce(goodbye=True)
         finally:
             stop_admin(self.admin)
+            stop_admin(self.gateway)
             self.net.close()
         if self.health is not None:
             self.health.stop()
@@ -1731,6 +1811,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"管理界面: enabled={cfg.server.management} "
                   f"url=http://{cfg.server.management_host}:{cfg.server.management_port}/ "
                   f"auth={'token' if cfg.server.management_token else 'none'}")
+            print(f"HTTP 网关: enabled={cfg.server.gateway} "
+                  f"port={cfg.server.gateway_port} "
+                  f"admin_host={cfg.server.gateway_admin_host or '(本机 IP / /admin)'}")
             print(f"文件日志: {cfg.server.log_file or '(禁用)'} "
                   f"单文件={cfg.server.log_max_bytes}B 保留={cfg.server.log_backup_count}份 "
                   f"过期={cfg.server.log_retention_days}天 "

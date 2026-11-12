@@ -2,7 +2,7 @@
 #
 # 启动：  docker compose up -d --build
 # 日志：  docker compose logs -f
-# 管理台：http://127.0.0.1:8765/
+# 管理台：http://127.0.0.1:8765/   （也可经 HTTP 网关 http://<管理台域名>/ 访问，默认 80）
 #
 # 关键：必须 network_mode: host。mDNS 走 224.0.0.251:5353 二层组播，
 #       bridge 网络无法收发，也无法让局域网客户端直连应答里的目标 IP。

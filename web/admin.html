@@ -462,30 +462,30 @@ const DEMO_STATUS = {
   config_saves:12
 };
 const DEMO_CONFIG = {
-  raw:'# mDNS Responder 配置\n[server]\ninterface = "0.0.0.0"\ngroup = "224.0.0.251"\nport = 5353\nttl = 120\nannounce_interval = 60\nannounce_count = 3\nreverse_ptr = true\nmanagement = true\nmanagement_host = "127.0.0.1"\nmanagement_port = 8765\nmanagement_token = ""\n\n[[hosts]]\nname = "nas.local"\nip = "172.15.103.30"\n\n[[hosts]]\nname = "camera.local"\nip = "172.15.103.31"\n\n[[services]]\ntype = "_http._tcp.local"\ninstance = "Office Web"\nhost = "nas.local"\nip = "172.15.103.30"\nport = 8080\ntxt = { path = "/", version = "1.0" }\n\n[[services]]\ntype = "_eam._tcp.local"\ninstance = "Hermes EAM"\nip = "172.15.103.30"\nport = 18080\ntxt = { module = "measure", env = "dev" }\n',
+  raw:'# mDNS Responder 配置\n[server]\ninterface = "0.0.0.0"\ngroup = "224.0.0.251"\nport = 5353\nttl = 120\nannounce_interval = 60\nannounce_count = 3\nreverse_ptr = true\nmanagement = true\nmanagement_host = "127.0.0.1"\nmanagement_port = 8765\nmanagement_token = ""\n\n[[hosts]]\nname = "nas.local"\nip = "172.15.103.30"\n\n[[hosts]]\nname = "camera.local"\nip = "172.15.103.31"\n\n[[hosts]]\nname = "printer.local"\nip = "172.15.103.77"\n\n[[services]]\ntype = "_http._tcp.local"\ninstance = "Office Web"\nhost = "nas.local"\nip = "172.15.103.30"\nport = 8080\ntxt = { path = "/", version = "1.0" }\n\n[[services]]\ntype = "_print._tcp.local"\ninstance = "Office Printer"\nhost = "printer.local"\nip = "172.15.103.77"\nport = 515\ntxt = { model = "LaserJet", ty = "Office Printer" }\n',
   config:{
     server:{interface:'0.0.0.0',group:'224.0.0.251',port:5353,ttl:120,announce_interval:60,announce_count:3,reverse_ptr:true,management:true,management_host:'127.0.0.1',management_port:8765,management_token:''},
     hosts:[{name:'nas.local',ip:'172.15.103.30'},{name:'camera.local',ip:'172.15.103.31'}],
     services:[
       {type:'_http._tcp.local',instance:'Office Web',host:'nas.local',ip:'172.15.103.30',port:8080,txt:{path:'/',version:'1.0'}},
-      {type:'_eam._tcp.local',instance:'Hermes EAM',host:'',ip:'172.15.103.30',port:18080,txt:{module:'measure',env:'dev'}}
+      {type:'_print._tcp.local',instance:'Office Printer',host:'printer.local',ip:'172.15.103.77',port:515,txt:{model:'LaserJet',ty:'Office Printer'}}
     ]
   }
 };
 const DEMO_RECORDS = [
   {type:'A',name:'nas.local',ttl:120,flush:true,value:'172.15.103.30',extras:0},
   {type:'A',name:'camera.local',ttl:120,flush:true,value:'172.15.103.31',extras:0},
-  {type:'A',name:'hermes-eam.local',ttl:120,flush:true,value:'172.15.103.30',extras:0},
+  {type:'A',name:'printer.local',ttl:120,flush:true,value:'172.15.103.77',extras:0},
   {type:'PTR',name:'30.103.15.172.in-addr.arpa',ttl:120,flush:true,value:'nas.local.',extras:0},
   {type:'PTR',name:'31.103.15.172.in-addr.arpa',ttl:120,flush:true,value:'camera.local.',extras:0},
   {type:'SRV',name:'Office Web._http._tcp.local',ttl:120,flush:true,value:'port=8080  target=nas.local.',extras:2},
-  {type:'SRV',name:'Hermes EAM._eam._tcp.local',ttl:120,flush:true,value:'port=18080  target=hermes-eam.local.',extras:2},
+  {type:'SRV',name:'Office Printer._print._tcp.local',ttl:120,flush:true,value:'port=515  target=printer.local.',extras:2},
   {type:'TXT',name:'Office Web._http._tcp.local',ttl:120,flush:true,value:'path=/  version=1.0',extras:2},
-  {type:'TXT',name:'Hermes EAM._eam._tcp.local',ttl:120,flush:true,value:'env=dev  module=measure',extras:2},
+  {type:'TXT',name:'Office Printer._print._tcp.local',ttl:120,flush:true,value:'model=LaserJet  ty=Office Printer',extras:2},
   {type:'PTR',name:'_http._tcp.local',ttl:120,flush:false,value:'Office Web._http._tcp.local.',extras:3},
-  {type:'PTR',name:'_eam._tcp.local',ttl:120,flush:false,value:'Hermes EAM._eam._tcp.local.',extras:3},
+  {type:'PTR',name:'_print._tcp.local',ttl:120,flush:false,value:'Office Printer._print._tcp.local.',extras:3},
   {type:'PTR',name:'_services._dns-sd._udp.local',ttl:120,flush:false,value:'_http._tcp.local.',extras:6},
-  {type:'PTR',name:'_services._dns-sd._udp.local',ttl:120,flush:false,value:'_eam._tcp.local.',extras:6}
+  {type:'PTR',name:'_services._dns-sd._udp.local',ttl:120,flush:false,value:'_print._tcp.local.',extras:6}
 ];
 function demoLog(t,lv,msg){return {time:t,level:lv,name:'mdns',msg:msg};}
 const DEMO_LOGS = [
@@ -557,7 +557,7 @@ function loadDemo(){
     {key:'host:nas.local',kind:'host',label:'nas.local',target:'172.15.103.30:80',status:'up',latency_ms:3,checked_at:Date.now()/1000},
     {key:'host:camera.local',kind:'host',label:'camera.local',target:'172.15.103.31:80',status:'down',latency_ms:2000,checked_at:Date.now()/1000},
     {key:'svc:0:nas.local',kind:'service',label:'Office Web',target:'172.15.103.30:8080',status:'up',latency_ms:5,checked_at:Date.now()/1000},
-    {key:'svc:1:hermes-eam.local',kind:'service',label:'Hermes EAM',target:'172.15.103.30:18080',status:'up',latency_ms:4,checked_at:Date.now()/1000}]};
+    {key:'svc:1:printer.local',kind:'service',label:'Office Printer',target:'172.15.103.77:515',status:'up',latency_ms:4,checked_at:Date.now()/1000}]};
   S.queries={enabled:true,total:1284,buffer:500,items:[
     {time:'10:12:31',client:'172.15.103.88:5353',names:['nas.local'],qtypes:['A'],hit:true,unicast:false},
     {time:'10:12:44',client:'172.15.103.42:60412',names:['_services._dns-sd._udp.local'],qtypes:['PTR'],hit:true,unicast:true},
@@ -565,8 +565,8 @@ function loadDemo(){
     {time:'10:13:40',client:'172.15.103.55:44120',names:['Office Web._http._tcp.local'],qtypes:['SRV','TXT','A'],hit:true,unicast:true}]};
   S.browse={enabled:true,scan_interval:45,last_scan:Date.now()/1000-12,count:3,items:[
     {fqdn:'office web._http._tcp.local',instance:'Office Web',type:'_http._tcp.local',port:8080,host:'nas.local.',host_ip:'172.15.103.30',txt:'path=/  version=1.0',source:'127.0.0.1:5353',ttl:120,ours:true,last_seen:Date.now()/1000},
-    {fqdn:'hermes eam._eam._tcp.local',instance:'Hermes EAM',type:'_eam._tcp.local',port:18080,host:'hermes-eam.local.',host_ip:'172.15.103.30',txt:'env=dev  module=measure',source:'127.0.0.1:5353',ttl:120,ours:true,last_seen:Date.now()/1000},
-    {fqdn:'printer._print._tcp.local',instance:'Printer',type:'_print._tcp.local',port:515,host:'printer.local.',host_ip:'172.15.103.77',txt:'model=LaserJet',source:'172.15.103.77:5353',ttl:120,ours:false,last_seen:Date.now()/1000-30}]};
+    {fqdn:'office printer._print._tcp.local',instance:'Office Printer',type:'_print._tcp.local',port:515,host:'printer.local.',host_ip:'172.15.103.77',txt:'model=LaserJet  ty=Office Printer',source:'127.0.0.1:5353',ttl:120,ours:true,last_seen:Date.now()/1000},
+    {fqdn:'media hub._http._tcp.local',instance:'Media Hub',type:'_http._tcp.local',port:8000,host:'media.local.',host_ip:'172.15.103.90',txt:'app=media',source:'172.15.103.90:5353',ttl:120,ours:false,last_seen:Date.now()/1000-30}]};
   S.conflicts={enabled:true,count:0,items:[]};
   S.auth={enabled:true,updated_at:'2026-11-12 15:30',path:'/opt/mdns/auth.toml'};
   S.history={enabled:true,limit:30,count:2,items:[
@@ -820,7 +820,10 @@ const SERVER_FIELDS=[
   {k:'announce_count',label:'启动宣告次数',type:'number'},
   {k:'management_host',label:'管理监听地址',type:'text'},
   {k:'management_port',label:'管理端口',type:'number'},
-  {k:'management_token',label:'访问令牌',type:'password'}
+  {k:'management_token',label:'访问令牌',type:'password'},
+  {k:'gateway_port',label:'网关端口',type:'number'},
+  {k:'gateway_admin_host',label:'管理台域名',type:'text'},
+  {k:'gateway_timeout',label:'网关超时 (s)',type:'number'}
 ];
 function serverField(f,v){
   const id='srv-'+f.k;
@@ -844,18 +847,20 @@ function insNum(key,label,value,hint){
 function hostRow(h,i){
   return '<tr class="host-row"><td><input class="inp" data-key="name" value="'+esc(h.name)+'" placeholder="nas.local"></td>'+
     '<td><input class="inp mono" data-key="ip" value="'+esc(h.ip)+'" placeholder="192.168.1.10"></td>'+
-    '<td style="width:96px"><div class="cell-actions"><a class="row-open" href="/go/'+encodeURIComponent(h.name)+'/" target="_blank" title="在网关中打开（目标不可达会显示友好页）">打开</a>'+
+    '<td style="width:116px"><div class="cell-actions"><a class="row-open" href="http://'+esc(h.name)+'/" target="_blank" title="直接域名访问（需开启网关）">直达</a><a class="row-open" href="/go/'+encodeURIComponent(h.name)+'/" target="_blank" title="在网关中打开（目标不可达会显示友好页）">打开</a>'+
     '<button class="row-del" data-act="del-host" data-idx="'+i+'" title="删除">'+icon('trash',15)+'</button></div></td></tr>';
 }
 function serviceRow(s,i){
   var gwh=(s.host||((s.instance||'').toLowerCase().replace(/[^a-z0-9-]/g,'-').replace(/^-+|-+$/g,'')||'mdns-host')+'.local');
+  var proxOn=(s.proxy!==false);  // 默认开启网关反代，保持向后兼容
   return '<tr class="svc-row"><td><input class="inp" data-key="type" value="'+esc(s.type)+'" placeholder="_http._tcp.local"></td>'+
     '<td><input class="inp" data-key="instance" value="'+esc(s.instance)+'" placeholder="Office Web"></td>'+
     '<td><input class="inp" data-key="host" value="'+esc(s.host||'')+'" placeholder="nas.local（可省略）"></td>'+
     '<td><input class="inp mono" data-key="ip" value="'+esc(s.ip)+'" placeholder="192.168.1.10"></td>'+
     '<td style="width:96px"><input class="inp mono" data-key="port" type="number" value="'+esc(s.port)+'"></td>'+
     '<td><input class="inp mono" data-key="txt" value="'+esc(txtToStr(s.txt))+'" placeholder="k=v, k2=v2"></td>'+
-    '<td style="width:96px"><div class="cell-actions"><a class="row-open" href="/go/'+encodeURIComponent(gwh)+'/" target="_blank" title="在网关中打开（目标不可达会显示友好页）">打开</a>'+
+    '<td style="width:84px;text-align:center;white-space:nowrap"><button type="button" class="switch'+(proxOn?' on':'')+'" data-key="proxy" data-act="toggle" title="开启后 http://'+esc(gwh)+' 经网关直达该端口；关闭则仅广播发现、不反代"></button></td>'+
+    '<td style="width:116px"><div class="cell-actions"><a class="row-open" href="http://'+esc(gwh)+'/" target="_blank" title="直接域名访问（需开启网关且开启反代）">直达</a><a class="row-open" href="/go/'+encodeURIComponent(gwh)+'/" target="_blank" title="在网关中打开（目标不可达会显示友好页）">打开</a>'+
     '<button class="row-del" data-act="del-service" data-idx="'+i+'" title="删除">'+icon('trash',15)+'</button></div></td></tr>';
 }
 function configExtras(){
@@ -928,20 +933,21 @@ function viewConfig(){
       '</div>';
     const form='<div class="form-grid">'+SERVER_FIELDS.map(function(f){return serverField(f,srv[f.k]);}).join('')+'</div>'+
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 26px;margin-top:12px;border-top:1px solid var(--line-soft);padding-top:8px">'+
-      switchRow('reverse_ptr','IPv4 反查 PTR',!!srv.reverse_ptr)+switchRow('management','Web 管理界面',!!srv.management)+'</div>'+
+      switchRow('reverse_ptr','IPv4 反查 PTR',!!srv.reverse_ptr)+switchRow('management','Web 管理界面',!!srv.management)+
+      switchRow('gateway','HTTP 网关（域名直达 80）',!!srv.gateway,'按 Host 头反代到服务端口，并把控制台收编进 80')+'</div>'+
       '<div style="margin-top:14px;padding:16px 18px;border-radius:16px;background:var(--bg-soft);border:1px solid var(--line-soft)">'+
       '<div style="font-size:12px;font-weight:750;margin-bottom:4px">'+icon('activity',14)+' 可观测增强</div>'+
       '<div style="font-size:11px;color:var(--ink-3);margin-bottom:10px">健康探测 / 局域网地图 / 查询审计 / 名称冲突，均热重载即时生效</div>'+insightsGrid+'</div>';
     const hosts='<table class="tbl"><thead><tr><th>域名</th><th>映射 IP</th><th></th></tr></thead><tbody>'+
       (c.hosts.length?c.hosts.map(hostRow).join(''):'<tr><td colspan="3" class="empty">暂无域名映射，点击下方按钮添加</td></tr>')+'</tbody></table>'+
       '<div style="margin-top:14px"><button class="chip" data-act="add-host">'+icon('plus',14)+' 添加域名映射</button></div>';
-    const services='<div style="overflow-x:auto"><table class="tbl" style="min-width:820px"><thead><tr><th>服务类型</th><th>实例名</th><th>绑定域名 (可选)</th><th>映射 IP</th><th>端口</th><th>TXT</th><th></th></tr></thead><tbody>'+
-      (c.services.length?c.services.map(serviceRow).join(''):'<tr><td colspan="7" class="empty">暂无服务，点击下方按钮添加</td></tr>')+'</tbody></table></div>'+
+    const services='<div style="overflow-x:auto"><table class="tbl" style="min-width:960px"><thead><tr><th>服务类型</th><th>实例名</th><th>绑定域名 (可选)</th><th>映射 IP</th><th>端口</th><th>TXT</th><th style="white-space:nowrap;min-width:84px">网关反代</th><th></th></tr></thead><tbody>'+
+      (c.services.length?c.services.map(serviceRow).join(''):'<tr><td colspan="8" class="empty">暂无服务，点击下方按钮添加</td></tr>')+'</tbody></table></div>'+
       '<div style="margin-top:14px"><button class="chip" data-act="add-service">'+icon('plus',14)+' 添加服务发布</button></div>';
     body=tabs+
       card('服务参数','修改端口 / 网卡 / 管理地址等需重启进程才会生效，其余参数热重载即时生效',form,'s12','d1')+
-      card('域名 → IP 映射','纯 A / AAAA 记录，域名写标准单 label .local 形式；点「打开」经网关访问，目标掉线会显示友好页',hosts,'s5','d2')+
-      card('服务发布 (DNS-SD)','每条自动生成 PTR + SRV + TXT + A；省略 host 时由实例名自动派生 <slug>.local；点「打开」经网关访问',services,'s7','d3');
+      card('域名 → IP 映射','纯 A / AAAA 记录，域名写标准单 label .local 形式；开启网关后可直接 http://域名 访问，或点「打开」经网关访问',hosts,'s5','d2')+
+      card('服务发布 (DNS-SD)','每条自动生成 PTR + SRV + TXT + A；省略 host 时由实例名自动派生 <slug>.local；「网关反代」开则 http://域名 直达端口，关则仅广播发现',services,'s7','d3');
   }
   const bar='<div class="savebar anim d4" style="margin-top:18px"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">'+
     '<span class="dirty'+(S.dirty?'':' hide')+'" id="dirtyFlag">● 有未保存的更改</span>'+
@@ -955,12 +961,12 @@ function syncFromDom(){
   const server={};
   document.querySelectorAll('[data-srv]').forEach(function(el){
     const k=el.dataset.srv,kind=el.dataset.kind;
-    if(kind==='number')server[k]=Number(el.value);
+    if(kind==='number'){const v=String(el.value==null?'':el.value).trim();if(v!=='')server[k]=Number(v);}
     else if(kind==='list')server[k]=String(el.value||'').split('\n').map(function(s){return s.trim();}).filter(Boolean);
     else server[k]=el.value;
   });
   ['reverse_ptr','management','health','browse','audit','conflict_detect',
-   'alert','alert_on_health','alert_on_conflict'].forEach(function(k){
+   'gateway','alert','alert_on_health','alert_on_conflict'].forEach(function(k){
     const el=document.querySelector('.switch[data-key="'+k+'"]');
     if(el)server[k]=el.classList.contains('on');
   });
@@ -969,8 +975,10 @@ function syncFromDom(){
   }).filter(function(h){return h.name||h.ip;});
   const services=[].slice.call(document.querySelectorAll('.svc-row')).map(function(r){
     const g=function(k){const e=r.querySelector('[data-key="'+k+'"]');return e?e.value.trim():'';};
+    const proxEl=r.querySelector('[data-key="proxy"]');
+    const proxy = proxEl ? proxEl.classList.contains('on') : true;
     return {type:g('type'),instance:g('instance'),host:g('host'),ip:g('ip'),
-            port:Number(g('port')||0),txt:strToTxt(g('txt'))};
+            port:Number(g('port')||0),txt:strToTxt(g('txt')),proxy:proxy};
   }).filter(function(s){return s.type||s.instance||s.ip;});
   S.config.config={server:server,hosts:hosts,services:services};
 }
@@ -1310,7 +1318,7 @@ async function runProbe(name,type){
 function addRow(kind){
   syncFromDom();
   if(kind==='host')S.config.config.hosts.push({name:'',ip:''});
-  else S.config.config.services.push({type:'_http._tcp.local',instance:'',host:'',ip:'',port:8080,txt:{}});
+  else S.config.config.services.push({type:'_http._tcp.local',instance:'',host:'',ip:'',port:8080,txt:{},proxy:true});
   S.dirty=true;renderTab();
   setTimeout(function(){const rows=document.querySelectorAll(kind==='host'?'.host-row':'.svc-row');const last=rows[rows.length-1];if(last){const i=last.querySelector('input');if(i)i.focus();}},60);
 }

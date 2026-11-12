@@ -230,6 +230,9 @@ SERVER_FIELDS = (
     ("announce_interval", int), ("announce_count", int), ("reverse_ptr", bool),
     ("management", bool), ("management_host", str),
     ("management_port", int), ("management_token", str),
+    # HTTP 网关（Host 头反代 + 管理台收编）
+    ("gateway", bool), ("gateway_port", int),
+    ("gateway_admin_host", str), ("gateway_timeout", float),
     ("log_file", str), ("log_max_bytes", int), ("log_backup_count", int),
     ("log_retention_days", int), ("log_console", bool),
     # 可观测增强（health / audit / browse / conflict）
@@ -244,6 +247,29 @@ SERVER_FIELDS = (
 )
 
 
+def _normalize_gateway_field(key: str, value):
+    """管理台表单的空值不该变成 0，否则开启网关时必然校验失败。
+
+    仅作用于「表单保存」链路（dump_toml）；手工编辑 TOML 走 raw 分支，
+    仍由 ServerConfig.validate() 严格校验，不会被这里悄悄改写。
+    """
+    if key == "gateway_port":
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return 80
+        return n if 1 <= n <= 65535 else 80
+    if key == "gateway_admin_host":
+        return str(value or "").strip() or "mdns.local"
+    if key == "gateway_timeout":
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return 5.0
+        return f if f > 0 else 5.0
+    return value
+
+
 def dump_toml(config: dict) -> str:
     """把结构化配置序列化为 TOML；server 中未提交的键由调用方先合并进 config。"""
     lines = [
@@ -256,7 +282,7 @@ def dump_toml(config: dict) -> str:
     for key, cast in SERVER_FIELDS:
         if key not in server or server[key] is None:
             continue
-        value = server[key]
+        value = _normalize_gateway_field(key, server[key])
         if cast is bool:
             lines.append(f"{key} = {'true' if value else 'false'}")
         elif cast is int:
@@ -286,6 +312,9 @@ def dump_toml(config: dict) -> str:
         if txt:
             pairs = ", ".join(f"{_toml_key(k)} = {_toml_str(v)}" for k, v in txt.items())
             lines.append(f"txt = {{ {pairs} }}")
+        # 网关反代开关：始终显式落盘，保证 TOML 与界面开关一一对应。
+        # 缺省仍为 true（兼容未写 proxy 的旧配置），只是不再省略。
+        lines.append("proxy = " + ("false" if svc.get("proxy") is False else "true"))
     return "\n".join(lines) + "\n"
 
 
@@ -438,11 +467,17 @@ class AdminHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, handler_cls, responder, log_handler, token):
+    def __init__(self, address, handler_cls, responder, log_handler, token,
+                 gateway_admin_host: str = "", gateway_timeout: float = 6.0,
+                 gateway_enabled: bool = False):
         super().__init__(address, handler_cls)
         self.responder = responder
         self.log_handler = log_handler
         self.token = token or ""
+        # 网关相关（仅网关服务器 gateway_enabled=True 时生效；管理台服务器恒为 False）
+        self.gateway_admin_host = gateway_admin_host or ""
+        self.gateway_timeout = float(gateway_timeout or 6.0)
+        self.gateway_enabled = gateway_enabled
         self.running = threading.Event()
         self.running.set()
 
@@ -558,11 +593,14 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # 网关：把 /go/<domain>/path 反代到该域名登记的目标；失败则给友好页而非报错栈
-    def _lookup_target(self, domain: str):
-        """同名既是 host（隐式 80）又是服务 host（显式端口）时，服务端口优先。
+    def _lookup_target(self, domain: str, only_proxied: bool = True):
+        """解析域名对应的反代目标 (ip, port)。
 
-        服务发布带显式 ip:port，是比 host 的默认 80 更具体的声明，故先解析服务；
-        仅当域名只是纯 host 映射时才回退到 80。避免「配了 8080 却访问到 80」。
+        only_proxied=True（默认）：仅返回「开启网关反代」的服务 / 域名映射目标，
+        用于真正转发请求；proxy=false 的服务会被跳过（返回 None）。
+        only_proxied=False：返回任何已登记匹配（无论是否开启反代），用于判断
+        该域名是否「已登记」——网关据此把已登记但未开反代的服务导向友好页，
+        而非误当成控制台。
         """
         cfg = self.server.responder.cfg
         name = domain.rstrip(".").lower()
@@ -570,8 +608,10 @@ class AdminHandler(BaseHTTPRequestHandler):
         for s in cfg.services:
             host = (s.host or f"{_slug(s.instance)}.local").rstrip(".").lower()
             if host == name:
+                if only_proxied and getattr(s, "proxy", True) is False:
+                    return None
                 return (s.ip, s.port)
-        # 2) 纯域名映射（hosts）默认走 80
+        # 2) 纯域名映射（hosts）默认走 80（hosts 无独立反代开关，始终可反代）
         for h in cfg.hosts:
             if h.name.rstrip(".").lower() == name:
                 return (h.ip, 80)
@@ -589,6 +629,10 @@ class AdminHandler(BaseHTTPRequestHandler):
             return self._friendly("notfound", detail="网关路径缺少域名，例如 /go/nas.local/")
         target = self._lookup_target(domain)
         if not target:
+            if self._lookup_target(domain, only_proxied=False):
+                return self._friendly(
+                    "notfound", domain=domain,
+                    detail="该服务已登记但未开启网关反代（在「服务发布」中打开「网关反代」开关）")
             return self._friendly(
                 "notfound", domain=domain,
                 detail="该域名未在 mDNS 控制台登记，无法路由")
@@ -637,6 +681,98 @@ class AdminHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    # -- 网关（按 Host 头反代）-------------------------------------------------
+    def _is_admin_request(self) -> bool:
+        """是否为「管理台请求」。
+
+        管理台服务器（gateway_enabled=False）永远返回 True：所有请求都交给
+        管理台逻辑处理。网关服务器（gateway_enabled=True）才按 Host 头分流：
+          1) Host == gateway_admin_host          -> 管理台（含所有路径）
+          2) Host 命中已注册服务 / 域名映射        -> 反代（即使是根路径 /）
+          3) 其余（盒子 IP / localhost / 未知）     -> 管理台（保留前缀 /api /admin 与根路径）
+        这样 http://<服务名>/ 直达后端，而 http://<盒子IP>/ 与 http://<管理台域名>/
+        都进控制台，互不冲突。
+        """
+        if not getattr(self.server, "gateway_enabled", False):
+            return True
+        host = (self.headers.get("Host", "").split(":")[0] or "").strip().lower()
+        admin_host = (self.server.gateway_admin_host or "").strip().lower()
+        if admin_host and host == admin_host:
+            return True
+        # 已登记的服务 / 域名映射（无论是否开启反代）都不交给控制台
+        if self._lookup_target(host, only_proxied=False):
+            return False
+        path = urlparse(self.path).path
+        if path.startswith("/api/") or path.startswith("/admin") or path == "/":
+            return True
+        return False
+
+    def _gateway_by_host(self, method: str) -> None:
+        """按 Host 头把请求反代到该域名登记的目标（services 显式端口 / hosts 默认 80）。
+
+        这是「域名直达」的关键：浏览器访问 http://ratio-guard.local 走 80，
+        网关读 Host 头找到目标 IP:端口并转发，等价于公司「防火墙 / 反代把域名映射到端口」。
+        """
+        host = (self.headers.get("Host", "").split(":")[0] or "").strip().lower()
+        target = self._lookup_target(host)
+        if not target:
+            if self._lookup_target(host, only_proxied=False):
+                return self._friendly(
+                    "notfound", domain=host,
+                    detail="该服务已登记但未开启网关反代（在「服务发布」中打开「网关反代」开关）")
+            return self._friendly(
+                "notfound", domain=host,
+                detail="该域名未在 mDNS 控制台登记，无法路由（可在「服务发布」或「域名映射」中补一条）")
+        ip, port = target
+        # 自环保护：目标指向网关自身（同端口的回环地址）时直接报错，避免无限转发
+        if port == self.server.server_address[1] and ip in ("127.0.0.1", "0.0.0.0", "::1"):
+            return self._friendly(
+                "unreachable", domain=host, target=f"{ip}:{port}",
+                detail="目标指向网关自身，请改用管理台域名（gateway_admin_host）访问控制台")
+        parsed = urlparse(self.path)
+        timeout = getattr(self.server, "gateway_timeout", 6.0)
+        try:
+            conn = http.client.HTTPConnection(ip, port, timeout=timeout)
+            fwd: dict[str, str] = {}
+            for key, val in self.headers.items():
+                low = key.lower()
+                if low in ("connection", "keep-alive", "proxy-connection",
+                           "transfer-encoding", "content-length", "host"):
+                    continue
+                fwd[key] = val
+            # 保留 Host 头，便于后端按虚拟主机路由
+            fwd["Host"] = host
+            body = None
+            if method in ("POST", "PUT", "PATCH", "DELETE"):
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length > 0:
+                    body = self.rfile.read(length)
+            conn.request(method, parsed.path + (("?" + parsed.query) if parsed.query else ""),
+                         body=body, headers=fwd)
+            resp = conn.getresponse()
+            payload = resp.read()
+        except Exception as exc:  # noqa: BLE001 - 目标不可达统一走友好页
+            return self._friendly(
+                "unreachable", domain=host, target=f"{ip}:{port}",
+                detail=_short_exc(exc))
+        try:
+            self.send_response(resp.status)
+            for key, val in resp.getheaders():
+                low = key.lower()
+                if low in ("transfer-encoding", "connection", "keep-alive",
+                           "content-length", "server", "date"):
+                    continue
+                self.send_header(key, val)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        finally:
+            conn.close()
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -766,6 +902,88 @@ class AdminHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 # 生命周期
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 网关：在独立端口（默认 80）按 Host 头反代 + 收编管理台
+# ---------------------------------------------------------------------------
+class GatewayHandler(AdminHandler):
+    """网关端口处理器：Host 头命中服务 -> 反代；命中管理台域名 / 盒子 IP -> 控制台。
+
+    复用 AdminHandler 的全部管理 API 与友好页，仅把「根 / 未知路径」的默认行为
+    从「404」改为「按 Host 反代」。原 /go/<domain>/ 路径反代仍保留。
+    """
+
+    def _dispatch_admin(self) -> None:
+        # 管理台只用了 GET / POST；HEAD 退化为只读流程
+        if self.command == "POST":
+            return super().do_POST()
+        return super().do_GET()
+
+    def do_GET(self) -> None:
+        if self._is_admin_request():
+            return self._dispatch_admin()
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/go/"):
+            return self._gateway(parsed)
+        return self._gateway_by_host("GET")
+
+    def do_POST(self) -> None:
+        if self._is_admin_request():
+            return self._dispatch_admin()
+        return self._gateway_by_host("POST")
+
+    def do_HEAD(self) -> None:
+        if self._is_admin_request():
+            return self._dispatch_admin()
+        return self._gateway_by_host("HEAD")
+
+    def do_PUT(self) -> None:
+        if self._is_admin_request():
+            return self._dispatch_admin()
+        return self._gateway_by_host("PUT")
+
+    def do_DELETE(self) -> None:
+        if self._is_admin_request():
+            return self._dispatch_admin()
+        return self._gateway_by_host("DELETE")
+
+    def do_PATCH(self) -> None:
+        if self._is_admin_request():
+            return self._dispatch_admin()
+        return self._gateway_by_host("PATCH")
+
+
+class HTTPGatewayServer(AdminHTTPServer):
+    """网关服务器：在网关端口上启用 Host 路由（gateway_enabled=True）。"""
+
+
+def start_gateway(responder, log_handler: RingLogHandler | None = None):
+    """在独立线程启动 HTTP 网关（默认 80）：按 Host 头反代 + 收编管理台。
+
+    端口冲突（如本机已有 Web 服务占用 80）时仅告警，不影响 mDNS 主服务。
+    """
+    server_cfg = responder.cfg.server
+    if not getattr(server_cfg, "gateway", False):
+        return None
+    handler = log_handler or install_logging()
+    try:
+        httpd = HTTPGatewayServer(
+            ("0.0.0.0", server_cfg.gateway_port),
+            GatewayHandler, responder, handler, server_cfg.management_token,
+            gateway_admin_host=server_cfg.gateway_admin_host,
+            gateway_timeout=server_cfg.gateway_timeout,
+            gateway_enabled=True,
+        )
+    except OSError as exc:
+        LOG.warning("HTTP 网关启动失败（不影响 mDNS 服务）: %s", exc)
+        return None
+    thread = threading.Thread(target=httpd.serve_forever, name="mdns-gateway", daemon=True)
+    thread.start()
+    admin_hint = server_cfg.gateway_admin_host or "(本机 IP 或 /admin)"
+    LOG.info("HTTP 网关已启动: http://0.0.0.0:%d/  (管理台域名=%s)",
+             server_cfg.gateway_port, admin_hint)
+    return httpd
+
+
 def start_admin(responder, log_handler: RingLogHandler | None = None):
     """在独立线程启动管理 HTTP 服务；端口冲突时仅告警，不影响 mDNS 主服务。"""
     server_cfg = responder.cfg.server

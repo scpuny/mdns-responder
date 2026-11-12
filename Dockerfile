@@ -23,8 +23,8 @@ RUN chmod +x start.sh install.sh deploy/docker-entrypoint.sh \
  && mkdir -p /data /app/logs \
  && cp config.example.toml /app/config.toml
 
-# 5353/udp = mDNS 组播；8765/tcp = Web 管理台（默认仅监听 127.0.0.1）
-EXPOSE 5353/udp 8765/tcp
+# 5353/udp = mDNS 组播；8765/tcp = Web 管理台；80/tcp = HTTP 网关（Host 头反代 + 控制台收编）
+EXPOSE 5353/udp 8765/tcp 80/tcp
 
 # 管理台状态接口即健康探针；需要 token 时也可改用 ?token= 或关闭鉴权
 HEALTHCHECK --interval=30s --timeout=5s --start-period=8s --retries=3 \

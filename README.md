@@ -424,6 +424,21 @@ curl -s http://127.0.0.1:8765/api/metrics
 > 架构边界：mDNS 模型下客户端解析 `.local` 后**直连目标 IP**，不经过本服务。
 > `/go/` 只是管理台提供的辅助入口，不是全局流量前置网关（那是 nginx 的角色）。
 
+### HTTP 网关（域名直达 80，可选）
+
+`[server].gateway = true` 时，本服务额外在 `gateway_port`（默认 80）监听一个 **Host 头反代网关**：
+浏览器访问 `http://<域名>`（不带端口）即被转发到该域名登记的目标 `ip:port`，等价于公司「防火墙 / 反代把域名映射到端口」。
+复用 `[[services]]` / `[[hosts]]` 作为路由规则，**加一条服务即自动可无端口访问，无需另装 nginx**。
+
+- `gateway_admin_host`（默认 `mdns.local`）：访问该域名（或盒子 IP、`/admin`）即进管理台控制台，不与服务反代冲突。
+- **每服务独立开关 `proxy`**：`[[services]]` 里可写 `proxy = false`——该服务仍正常广播 DNS-SD 发现，
+  但**不再经网关反代**（适合远程 / 非 HTTP 设备，如打印机）。访问其域名直达会返回友好页「未开启网关反代」。
+  缺省 `proxy = true`（即开启反代，兼容未写该字段的旧配置）。管理台保存时会**显式写出** `proxy = true` 或
+  `proxy = false`，保证配置文件与界面开关一一对应，便于核对。
+- **开 / 关即时生效**：全局 `gateway` 开关、网关端口 / 管理台域名 / 超时均支持热重载——在管理台改完保存即可，
+  不必 `docker restart`。底层会在重载时按配置自动启停网关 socket（关闭后 80 端口随即释放）。
+  （注意：mDNS 主端口 `port`、网卡 `interface/group`、以及 `log_*` 段仍属进程级参数，需重启才生效。）
+
 ---
 
 ## systemd 部署
@@ -524,7 +539,6 @@ CI：push / PR 到 `main` 时 GitHub Actions 执行 `py_compile`（全部 Python
 - 名称冲突只做**防御观测登记**（RFC 6762 §4），不做 RFC 6762 的 probing / 强制改名——需保证 `.local` 命名在网内唯一。
 - mDNS 只在同网段有效；跨网段 / VPN / 代理环境脆弱，团队级建议内网 DNS。
 - 管理员密码是「控制台写操作保护」，不是传输层加密；远程访问管理台请置于 HTTPS 反向代理之后。
-- 与 Hermes-EAM（Spring Boot）集成：可作独立 sidecar，或引入 JmDNS。
 
 ---
 

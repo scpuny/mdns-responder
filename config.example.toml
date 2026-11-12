@@ -38,6 +38,19 @@ management_host = "127.0.0.1"
 management_port = 8765
 management_token = ""
 
+# ---- HTTP 网关（域名直达端口，默认 80）----
+# 痛点：DNS/mDNS 只解析「域名 -> IP」，不含端口，所以 http://域名 永远走默认 80，
+#       浏览器/ curl 不会自动读 SRV 记录。公司「域名映射到端口」其实是防火墙/反代干的。
+# 本网关在 80 端口按 Host 头反代：复用 [[services]]（显式 ip:port）/ [[hosts]]（默认 80）
+# 作为转发规则，让你像公司一样「http://域名 直达后端」，且把管理台也收编进 80。
+#   - gateway_admin_host 域名 -> 管理台控制台（其余未知域名 -> 反代；盒子 IP / /admin 也进控制台）
+#   - 例：配了 ratio-guard.local -> 192.168.1.11:8788 后，http://ratio-guard.local 直达面板
+# 仅 HTTP（内网足够）；需要 HTTPS 时后续再叠加。端口冲突（如本机已有 Web 服务）仅告警不致命。
+gateway = true
+gateway_port = 80
+gateway_admin_host = "mdns.local"   # 访问该域名即进控制台；也可直接用 http://<盒子IP>/ 或 /admin
+gateway_timeout = 6.0               # 反代到后端的连接超时（秒）
+
 # ---- 有界文件日志（防止长期运行撑爆磁盘）----
 # log_file 相对项目根目录；留空 "" 则完全不写文件（仅控制台 + 管理页面 SSE 日志）
 # 轮转策略：单文件达到 log_max_bytes 即归档为 .1/.2...，最多保留
@@ -114,6 +127,10 @@ ip = "172.15.103.30"
 name = "camera.local"
 ip = "172.15.103.31"
 
+[[hosts]]
+name = "printer.local"
+ip = "172.15.103.77"
+
 
 # -----------------------------------------------------------------------------
 # 服务发现映射：域名（服务实例）+ IP + 端口
@@ -133,10 +150,14 @@ host = "nas.local"                 # 可省略，省略时由实例名自动生�
 ip = "172.15.103.30"               # 该服务实际所在 IP
 port = 8080                        # 该服务实际端口
 txt = { path = "/", version = "1.0" }
+# proxy = true                    # 可选；默认 true。true=开启 HTTP 网关反代（http://域名 直达端口）；
+                                   # false=仅广播 DNS-SD 发现、不反代（适合远程/非 HTTP 设备，如打印机）
 
 [[services]]
-type = "_eam._tcp.local"
-instance = "Hermes EAM"
-ip = "172.15.103.30"
-port = 18080
-txt = { module = "measure", env = "dev" }
+type = "_print._tcp.local"        # 打印机服务发现（DNS-SD 通用示例）
+instance = "Office Printer"
+host = "printer.local"
+ip = "172.15.103.77"
+port = 515
+txt = { model = "LaserJet", ty = "Office Printer" }
+proxy = false                     # 打印机是远程设备，仅广播发现、不走本机网关反代
