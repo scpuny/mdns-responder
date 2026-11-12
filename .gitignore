@@ -8,6 +8,13 @@ config.toml.bak
 # 实际运行配置（含本机 IP / token，不入库；模板 config.example.toml 已入库）
 config.toml
 
+# 管理员密码摘要（PBKDF2 加盐 hash，绝不明文落盘、绝不入库）
+auth.toml
+auth.toml.tmp
+
+# install.sh --upgrade 的现场备份
+.upgrade-backup-*
+
 # Python 字节码 / 缓存
 __pycache__/
 *.pyc

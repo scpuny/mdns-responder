@@ -416,7 +416,12 @@ const ICONS = {
   heart:'<path d="M12 20.5 4.6 13a4.8 4.8 0 0 1 6.8-6.8l.6.6.6-.6A4.8 4.8 0 0 1 19.4 13Z"/><path d="M7 12h2.5l1.5-3 2 6 1.5-3H17"/>',
   globe:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.6 3.8 6 3.8 9S14.6 18.4 12 21M12 3C9.4 5.6 8.2 9 8.2 12S9.4 18.4 12 21"/>',
   activity:'<path d="M3 12h4l2.5 7L14 4l2.5 8H21"/>',
-  alert:'<path d="M10.3 4.3 2.5 18a2 2 0 0 0 1.7 3h15.6a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0Z"/><path d="M12 9v5M12 17.5h.01"/>'
+  alert:'<path d="M10.3 4.3 2.5 18a2 2 0 0 0 1.7 3h15.6a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0Z"/><path d="M12 9v5M12 17.5h.01"/>',
+  lock:'<rect x="4" y="10" width="16" height="11" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v2.5"/>',
+  history:'<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3.5 2"/>',
+  bell:'<path d="M18 9a6 6 0 0 0-12 0c0 5-2 6-2 6h16s-2-1-2-6M10 20a2 2 0 0 0 4 0"/>',
+  chart:'<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  key:'<circle cx="8" cy="15" r="4"/><path d="M11 12 21 2l1 1-3 3 2 2-3 3-2-2-2 2"/>'
 };
 function icon(n,s){s=s||18;return '<svg width="'+s+'" height="'+s+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'+(ICONS[n]||'')+'</svg>';}
 function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
@@ -432,6 +437,8 @@ let BASE = localStorage.getItem('mdns.endpoint') ||
 const S = {
   demo:false, tab:'overview', theme:localStorage.getItem('mdns.theme')||'auto',
   token:localStorage.getItem('mdns.token')||'', status:null, config:null,
+  adminPw:sessionStorage.getItem('mdns.adminpw')||'',
+  auth:null, history:null, alerts:null,
   ifaceOptions:[], records:[], logs:[], probe:null,
   probeName:'_services._dns-sd._udp.local', probeType:'PTR', dirty:false, configMode:'form',
   typeFilter:'ALL', recordSearch:'', logLevel:'ALL', autoScroll:true, es:null,
@@ -448,7 +455,11 @@ const DEMO_STATUS = {
     browse:{enabled:true,scan_interval:45,instances:2},
     conflicts:{enabled:true,count:0}
   },
-  config_path:'/opt/mdns/config.toml'
+  config_path:'/opt/mdns/config.toml',
+  security:{admin_password_enabled:true,auth_updated_at:'2026-11-12 15:30'},
+  history:{limit:30,count:2},
+  alerts:{enabled:true,webhooks:1,sent:3,failed:0},
+  config_saves:12
 };
 const DEMO_CONFIG = {
   raw:'# mDNS Responder 配置\n[server]\ninterface = "0.0.0.0"\ngroup = "224.0.0.251"\nport = 5353\nttl = 120\nannounce_interval = 60\nannounce_count = 3\nreverse_ptr = true\nmanagement = true\nmanagement_host = "127.0.0.1"\nmanagement_port = 8765\nmanagement_token = ""\n\n[[hosts]]\nname = "nas.local"\nip = "172.15.103.30"\n\n[[hosts]]\nname = "camera.local"\nip = "172.15.103.31"\n\n[[services]]\ntype = "_http._tcp.local"\ninstance = "Office Web"\nhost = "nas.local"\nip = "172.15.103.30"\nport = 8080\ntxt = { path = "/", version = "1.0" }\n\n[[services]]\ntype = "_eam._tcp.local"\ninstance = "Hermes EAM"\nip = "172.15.103.30"\nport = 18080\ntxt = { module = "measure", env = "dev" }\n',
@@ -497,10 +508,15 @@ async function api(path,opts){
   opts=opts||{};
   const headers={'Content-Type':'application/json'};
   if(S.token) headers['X-Admin-Token']=S.token;
+  if(S.adminPw) headers['X-Admin-Password']=S.adminPw;
   const res=await fetch(BASE+path,Object.assign({},opts,{headers:Object.assign(headers,opts.headers||{})}));
   if(res.status===401){askToken();throw new Error('需要访问令牌');}
   let body={};try{body=await res.json();}catch(e){body={};}
-  if(!res.ok) throw new Error(body.error||('HTTP '+res.status));
+  if(!res.ok){
+    // 密码被改 / 缓存失效时清掉会话内缓存，下次写操作会重新弹窗
+    if(body.code==='auth_failed'&&path!=='/api/auth/verify')forgetPw();
+    throw new Error(body.error||('HTTP '+res.status));
+  }
   return body;
 }
 function toast(msg,kind){
@@ -552,18 +568,29 @@ function loadDemo(){
     {fqdn:'hermes eam._eam._tcp.local',instance:'Hermes EAM',type:'_eam._tcp.local',port:18080,host:'hermes-eam.local.',host_ip:'172.15.103.30',txt:'env=dev  module=measure',source:'127.0.0.1:5353',ttl:120,ours:true,last_seen:Date.now()/1000},
     {fqdn:'printer._print._tcp.local',instance:'Printer',type:'_print._tcp.local',port:515,host:'printer.local.',host_ip:'172.15.103.77',txt:'model=LaserJet',source:'172.15.103.77:5353',ttl:120,ours:false,last_seen:Date.now()/1000-30}]};
   S.conflicts={enabled:true,count:0,items:[]};
+  S.auth={enabled:true,updated_at:'2026-11-12 15:30',path:'/opt/mdns/auth.toml'};
+  S.history={enabled:true,limit:30,count:2,items:[
+    {id:'config-20261112T150000Z-a1b2c3.json',time:'2026-11-12 15:00:00',reason:'before-save',size:1180,records:4,preview:'# mDNS Responder 配置 …'},
+    {id:'config-20261112T143000Z-d4e5f6.json',time:'2026-11-12 14:30:00',reason:'before-rollback',size:1160,records:4,preview:'# mDNS Responder 配置 …'}]};
+  S.alerts={enabled:true,webhooks:1,cooldown:300,on_health:true,on_conflict:true,
+    hooks:[{platform:'dingtalk',url_mask:'…xxxxxxxxxx'}],queued:0,health_tracked:4,
+    stats:{events:3,sent:3,failed:0,dropped:0,last_error:'',last_sent_at:0}};
 }
 async function refreshAll(){
   const st=await api('/api/status');S.status=st;
-  const [cfg,rec,logs,ifaces,health,queries,browse,conflicts]=await Promise.all([
+  const [cfg,rec,logs,ifaces,health,queries,browse,conflicts,auth,hist,alerts]=await Promise.all([
     api('/api/config'),api('/api/records'),api('/api/logs?limit=300'),api('/api/interfaces'),
     api('/api/health').catch(function(){return {enabled:false,items:[]};}),
     api('/api/queries?limit=100').catch(function(){return {enabled:false,items:[],total:0};}),
     api('/api/browse').catch(function(){return {enabled:false,items:[],count:0};}),
-    api('/api/conflicts').catch(function(){return {enabled:false,items:[],count:0};})]);
+    api('/api/conflicts').catch(function(){return {enabled:false,items:[],count:0};}),
+    api('/api/auth').catch(function(){return {enabled:false};}),
+    api('/api/config/history').catch(function(){return {enabled:false,items:[],count:0,limit:30};}),
+    api('/api/alerts').catch(function(){return {enabled:false,webhooks:0,stats:{sent:0,failed:0}};})]);
   S.config=cfg;S.records=rec.items||[];S.logs=logs.items||[];
   S.ifaceOptions=(ifaces.items||[]).slice();
   S.health=health;S.queries=queries;S.browse=browse;S.conflicts=conflicts;
+  S.auth=auth;S.history=hist;S.alerts=alerts;
 }
 async function refreshInsights(){
   if(S.demo)return;
@@ -724,6 +751,24 @@ function typeBars(){
     return '<div class="bar-row"><span class="bar-label">'+k+'</span><div class="bar-track"><div class="bar-fill" style="width:'+(counts[k]/max*100).toFixed(1)+'%;animation-delay:'+(i*.09)+'s"></div></div><span class="bar-num tabnum">'+counts[k]+'</span></div>';
   }).join('')+'<div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line-soft);font-size:11.5px;color:var(--ink-3)">共 <b style="color:var(--ink)">'+S.records.length+'</b> 条记录，缓存刷新位与附加记录按 RFC 6762 / 6763 自动生成</div>';
 }
+function opsBody(){
+  const st=S.status||{};
+  const sec=st.security||{},al=st.alerts||{},hi=st.history||{};
+  const astat=(S.alerts&&S.alerts.stats)||{};
+  const metricUrl='/api/metrics'+(S.token?'?token='+encodeURIComponent(S.token):'');
+  const rows=[
+    ['Prometheus 指标','<a class="row-open" href="'+esc(metricUrl)+'" target="_blank">/api/metrics</a> <span class="t-muted">· 文本格式 0.0.4，可直接被 Prometheus 抓取</span>'],
+    ['管理员密码',sec.admin_password_enabled?'<span class="badge b-SRV">已启用</span> <span class="t-muted">· 更新于 '+esc(sec.auth_updated_at||'—')+'</span>':'<span style="color:var(--err);font-weight:650">未设置</span> <span class="t-muted">· 首次保存配置时会引导初始化</span>'],
+    ['配置版本快照',fmtNum(hi.count||0)+' 份 <span class="t-muted">· 上限 '+fmtNum(hi.limit||30)+' 份 · 保存 / 回滚前自动生成</span>'],
+    ['告警 Webhook',(al.enabled?'已启用':'已关闭')+' <span class="t-muted">· '+fmtNum(al.webhooks||0)+' 个端点 · 已发 '+fmtNum(astat.sent||0)+' 条 / 失败 '+fmtNum(astat.failed||0)+' 条</span>']
+  ];
+  return '<div class="form-grid" style="grid-template-columns:repeat(2,minmax(0,1fr));gap:12px">'+
+    rows.map(function(p){
+      return '<div style="padding:13px 15px;border-radius:13px;background:var(--bg-soft);border:1px solid var(--line-soft)">'+
+        '<div style="font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);font-weight:700;margin-bottom:7px">'+esc(p[0])+'</div>'+
+        '<div style="font-size:12.5px;line-height:1.6">'+p[1]+'</div></div>';
+    }).join('')+'</div>';
+}
 function viewOverview(){
   const st=S.status||{};
   const stats=st.stats||{};
@@ -757,6 +802,7 @@ function viewOverview(){
     card('运行参数','当前生效的服务端配置','<div class="form-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));gap:14px">'+info.map(function(p){
       return '<div style="padding:12px 14px;border-radius:13px;background:var(--bg-soft);border:1px solid var(--line-soft)"><div style="font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);font-weight:700">'+esc(p[0])+'</div><div class="mono" style="margin-top:6px;font-size:12px;word-break:break-all">'+esc(p[1])+'</div></div>';
     }).join('')+'</div>','s12','d6')+
+    card('运维接口与安全','Prometheus 抓取 · 告警投递 · 管理员密码状态',opsBody(),'s12','d6')+
   '</div>';
 }
 
@@ -786,8 +832,9 @@ function serverField(f,v){
   }
   return '<div class="field"><label for="'+id+'">'+esc(f.label)+'</label><input class="inp" id="'+id+'" data-srv="'+f.k+'" data-kind="'+f.type+'" type="'+f.type+'" value="'+esc(v)+'"'+(f.type==='password'?' autocomplete="off" placeholder="留空表示不鉴权"':'')+'></div>';
 }
-function switchRow(key,label,checked){
-  return '<div class="switch-row"><div><div style="font-size:12.5px;font-weight:650">'+esc(label)+'</div><div style="font-size:11px;color:var(--ink-3)">'+esc(key==='reverse_ptr'?'发布 in-addr.arpa 反查 PTR':'启用内置 Web 管理界面')+'</div></div>'+
+function switchRow(key,label,checked,hint){
+  const sub=hint||(key==='reverse_ptr'?'发布 in-addr.arpa 反查 PTR':'启用内置 Web 管理界面');
+  return '<div class="switch-row"><div><div style="font-size:12.5px;font-weight:650">'+esc(label)+'</div><div style="font-size:11px;color:var(--ink-3)">'+esc(sub)+'</div></div>'+
     '<button type="button" class="switch'+(checked?' on':'')+'" data-act="toggle" data-key="'+key+'" aria-label="'+esc(label)+'"></button></div>';
 }
 function insNum(key,label,value,hint){
@@ -810,6 +857,53 @@ function serviceRow(s,i){
     '<td><input class="inp mono" data-key="txt" value="'+esc(txtToStr(s.txt))+'" placeholder="k=v, k2=v2"></td>'+
     '<td style="width:96px"><div class="cell-actions"><a class="row-open" href="/go/'+encodeURIComponent(gwh)+'/" target="_blank" title="在网关中打开（目标不可达会显示友好页）">打开</a>'+
     '<button class="row-del" data-act="del-service" data-idx="'+i+'" title="删除">'+icon('trash',15)+'</button></div></td></tr>';
+}
+function configExtras(){
+  const auth=S.auth||{},hist=S.history||{},al=S.alerts||{},astat=(al.stats||{});
+  const c=(S.config&&S.config.config)||{},srv=c.server||{};
+
+  // -- 安全设置 --
+  const secBody='<div style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">'+
+    '<div><div style="font-size:13px;font-weight:650;display:flex;align-items:center;gap:7px">'+icon('lock',15)+' 管理员密码</div>'+
+    '<div style="font-size:11.5px;color:var(--ink-3);margin-top:7px;line-height:1.6">'+
+      (auth.enabled?'已启用 · 更新于 '+esc(auth.updated_at||'—')+' · 修改配置 / 回滚 / 改密都需要输入':
+        '<span style="color:var(--warn);font-weight:650">尚未设置</span> · 首次保存配置会引导初始化（至少 8 位）')+
+    '</div></div>'+
+    '<button class="btn ghost" data-act="change-password">'+icon('key',15)+' '+(auth.enabled?'修改密码':'设置密码')+'</button></div>'+
+    '<div style="margin-top:13px;font-size:11px;color:var(--ink-3);border-top:1px solid var(--line-soft);padding-top:11px;line-height:1.6">'+
+    '密码以 PBKDF2-SHA256 加盐摘要存于 <span class="mono">auth.toml</span>（已加入 .gitignore），服务端不保存明文；浏览器仅在本次会话内缓存，关闭标签页即失效。</div>';
+
+  // -- 配置版本历史 --
+  const items=hist.items||[];
+  const histRows=items.length?items.map(function(h){
+    return '<tr><td class="mono">'+esc(h.time)+'</td><td>'+esc(h.reason)+'</td>'+
+      '<td class="t-mono">'+fmtBytes(h.size)+'</td><td class="tabnum">'+fmtNum(h.records)+'</td>'+
+      '<td style="width:104px"><button class="chip" data-act="rollback" data-id="'+esc(h.id)+'">'+icon('history',13)+' 恢复</button></td></tr>';
+  }).join(''):'<tr><td colspan="5" class="empty">暂无快照；每次保存配置前会自动生成一份</td></tr>';
+  const histBody='<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>快照时间</th><th>来源</th><th>大小</th><th>映射</th><th></th></tr></thead><tbody>'+
+    histRows+'</tbody></table></div>'+
+    '<div style="margin-top:13px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">'+
+    '<button class="chip" data-act="history-refresh">'+icon('refresh',13)+' 刷新历史</button>'+
+    '<span style="font-size:11px;color:var(--ink-3)">保留最近 '+fmtNum(hist.limit||30)+' 份 · 回滚本身也会先存一份当前配置</span></div>';
+
+  // -- 告警 Webhook --
+  const hooks=(srv.alert_webhooks||[]).join('\n');
+  const alertBody='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 26px">'+
+      switchRow('alert','启用告警 Webhook',!!srv.alert,'总开关；未配 URL 时仅登记事件')+
+      switchRow('alert_on_health','健康状态翻转告警',!!srv.alert_on_health,'up → down / down → up 触发')+
+      switchRow('alert_on_conflict','名称冲突告警',!!srv.alert_on_conflict,'本地同名异值的外来记录')+'</div>'+
+    '<div class="form-grid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-top:12px">'+
+      insNum('alert_cooldown','事件冷却 (s)',srv.alert_cooldown!=null?srv.alert_cooldown:300,'0 = 不去重')+
+      insNum('alert_timeout','请求超时 (s)',srv.alert_timeout!=null?srv.alert_timeout:5,'0.5..30')+
+      insNum('history_limit','历史保留份数',srv.history_limit!=null?srv.history_limit:30,'≥1')+'</div>'+
+    '<div class="field" style="margin-top:13px"><label>Webhook URL（每行一个，平台自动识别）</label>'+
+      '<textarea class="inp" id="alertHooks" data-srv="alert_webhooks" data-kind="list" rows="3" style="min-height:80px;resize:vertical;line-height:1.6" placeholder="https://oapi.dingtalk.com/robot/send?access_token=…">'+esc(hooks)+'</textarea>'+
+      '<div style="font-size:11px;color:var(--ink-3);margin-top:5px;line-height:1.6">钉钉 / 飞书 / Slack / 企业微信按域名自动适配，其余按通用 JSON 投递。当前 <b>'+fmtNum(al.webhooks||0)+'</b> 个端点 · 累计发送 '+fmtNum(astat.sent||0)+' 条 · 失败 '+fmtNum(astat.failed||0)+' 条'+
+      (astat.last_error?' · <span style="color:var(--err)">最近错误 '+esc(astat.last_error)+'</span>':'')+'</div></div>';
+
+  return card('安全设置','修改配置、回滚与改密均需管理员密码',secBody,'s12','d2')+
+         card('配置版本历史','每次保存 / 回滚前自动快照，可一键恢复',histBody,'s12','d3')+
+         card('告警通知','健康翻转与名称冲突推送到群机器人',alertBody,'s12','d4');
 }
 function viewConfig(){
   const c=(S.config&&S.config.config)||{server:{},hosts:[],services:[]};
@@ -854,16 +948,19 @@ function viewConfig(){
     '<span style="font-size:11.5px;color:var(--ink-3)">保存前自动校验；原文件备份为 config.toml.bak</span></div>'+
     '<div style="display:flex;gap:9px"><button class="btn ghost" data-act="reload">'+icon('refresh',15)+' 重新载入</button>'+
     '<button class="btn" data-act="save">保存并热重载<span class="bico">'+icon('arrow',14)+'</span></button></div></div>';
-  return body+bar;
+  return body+configExtras()+bar;
 }
 function syncFromDom(){
   if(S.tab!=='config'||S.configMode!=='form'||!S.config)return;
   const server={};
   document.querySelectorAll('[data-srv]').forEach(function(el){
     const k=el.dataset.srv,kind=el.dataset.kind;
-    server[k]=kind==='number'?Number(el.value):el.value;
+    if(kind==='number')server[k]=Number(el.value);
+    else if(kind==='list')server[k]=String(el.value||'').split('\n').map(function(s){return s.trim();}).filter(Boolean);
+    else server[k]=el.value;
   });
-  ['reverse_ptr','management','health','browse','audit','conflict_detect'].forEach(function(k){
+  ['reverse_ptr','management','health','browse','audit','conflict_detect',
+   'alert','alert_on_health','alert_on_conflict'].forEach(function(k){
     const el=document.querySelector('.switch[data-key="'+k+'"]');
     if(el)server[k]=el.classList.contains('on');
   });
@@ -1088,10 +1185,101 @@ function setTab(t){if(S.tab===t)return;syncFromDom();S.tab=t;
   var v=document.getElementById('view');if(v)v.classList.remove('noanim'); // 主动切 tab：恢复入场动画
   render();}
 function setConfigMode(m){syncFromDom();S.configMode=m;S.dirty=false;renderTab();}
+function forgetPw(){S.adminPw='';try{sessionStorage.removeItem('mdns.adminpw');}catch(e){}}
+function rememberPw(pw){S.adminPw=pw;try{sessionStorage.setItem('mdns.adminpw',pw);}catch(e){}}
+function passwordModal(title,needConfirm){
+  return new Promise(function(resolve){
+    const root=document.getElementById('modalRoot');
+    root.innerHTML='<div class="modal-mask"><div class="modal">'+
+      '<h3>'+esc(title)+'</h3>'+
+      '<p>'+(needConfirm?'首次使用请设置管理员密码（至少 8 位）。之后修改配置、回滚与改密都需要输入它。':'请输入管理员密码以继续本次写操作。密码只在本次会话内缓存。')+'</p>'+
+      '<div class="field"><label>'+(needConfirm?'新密码':'管理员密码')+'</label>'+
+        '<input class="inp" id="pwA" type="password" autocomplete="new-password" placeholder="'+(needConfirm?'至少 8 位':'管理员密码')+'"></div>'+
+      (needConfirm?'<div class="field" style="margin-top:12px"><label>再输入一次</label><input class="inp" id="pwB" type="password" autocomplete="new-password" placeholder="确认新密码"></div>':'')+
+      '<div id="pwErr" style="color:var(--err);font-size:11.5px;margin-top:10px;min-height:16px"></div>'+
+      '<div style="display:flex;gap:9px;justify-content:flex-end;margin-top:14px">'+
+        '<button class="btn ghost" id="pwCancel">取消</button>'+
+        '<button class="btn" id="pwOk">确定<span class="bico">'+icon('arrow',14)+'</span></button></div>'+
+      '</div></div>';
+    function close(v){root.innerHTML='';resolve(v);}
+    document.getElementById('pwCancel').onclick=function(){close('');};
+    document.getElementById('pwOk').onclick=function(){
+      const a=document.getElementById('pwA').value,err=document.getElementById('pwErr');
+      if(needConfirm){
+        const b=document.getElementById('pwB').value;
+        if(a.length<8){err.textContent='密码至少 8 位';return;}
+        if(a!==b){err.textContent='两次输入不一致';return;}
+      }else if(!a){err.textContent='请输入密码';return;}
+      close(a);
+    };
+    const a=document.getElementById('pwA');a.focus();
+    a.addEventListener('keydown',function(e){if(e.key==='Enter')document.getElementById('pwOk').click();});
+  });
+}
+async function ensureAdminPassword(){
+  if(S.demo)return true;
+  if(!S.auth){try{S.auth=await api('/api/auth');}catch(e){S.auth={enabled:false};}}
+  if(!S.auth.enabled){
+    const pw=await passwordModal('首次设置管理员密码',true);
+    if(!pw)return false;
+    try{await api('/api/auth/password',{method:'POST',body:JSON.stringify({new_password:pw})});}
+    catch(e){toast('设置失败：'+e.message,'err');return false;}
+    rememberPw(pw);S.auth={enabled:true,updated_at:'刚刚'};
+    toast('管理员密码已设置，请妥善保管','ok');
+    return true;
+  }
+  if(S.adminPw){
+    try{const r=await api('/api/auth/verify',{method:'POST',body:'{}'});if(r.ok)return true;}catch(e){}
+    forgetPw();
+  }
+  const pw=await passwordModal('请输入管理员密码',false);
+  if(!pw)return false;
+  rememberPw(pw);
+  try{
+    const r=await api('/api/auth/verify',{method:'POST',body:'{}'});
+    if(!r.ok){forgetPw();toast('密码错误','err');return false;}
+    return true;
+  }catch(e){forgetPw();toast('密码校验失败：'+e.message,'err');return false;}
+}
+async function changePassword(){
+  if(S.demo){toast('演示模式：不修改密码','info');return;}
+  if(!(await ensureAdminPassword()))return;
+  const pw=await passwordModal('设置新的管理员密码',true);
+  if(!pw)return;
+  try{
+    await api('/api/auth/password',{method:'POST',body:JSON.stringify({new_password:pw})});
+    rememberPw(pw);
+    S.auth=await api('/api/auth');
+    toast('管理员密码已修改','ok');renderTab();
+  }catch(e){toast('修改失败：'+e.message,'err');}
+}
+async function doRollback(id){
+  if(!id)return;
+  if(!(await ensureAdminPassword()))return;
+  if(!window.confirm('确定回滚到该版本？当前配置会先自动存一份快照。'))return;
+  try{
+    const r=await api('/api/config/rollback',{method:'POST',body:JSON.stringify({id:id})});
+    toast(r.message||'已回滚','ok');
+    setTimeout(async function(){try{await refreshAll();renderTab();}catch(e){}},700);
+  }catch(e){toast('回滚失败：'+e.message,'err');}
+}
+async function refreshExtras(){
+  if(S.demo)return;
+  try{
+    const [a,h,al]=await Promise.all([
+      api('/api/auth').catch(function(){return null;}),
+      api('/api/config/history').catch(function(){return null;}),
+      api('/api/alerts').catch(function(){return null;})]);
+    if(a)S.auth=a;if(h)S.history=h;if(al)S.alerts=al;
+    const v=document.getElementById('view');if(v)v.classList.add('noanim');
+    renderTab();
+  }catch(e){}
+}
 async function saveConfig(){
   syncFromDom();
   const payload=S.configMode==='raw'?{raw:(document.getElementById('rawEditor')||{}).value||''}:{config:S.config.config};
   if(S.demo){S.dirty=false;toast('演示模式：配置已在本地模拟保存，未写入服务','info');renderTab();return;}
+  if(!(await ensureAdminPassword()))return;
   try{
     const r=await api('/api/config',{method:'POST',body:JSON.stringify(payload)});
     S.dirty=false;toast(r.message||'配置已保存','ok');
@@ -1152,6 +1340,9 @@ document.addEventListener('click',function(e){
   else if(a==='del-host')delRow('host',Number(el.dataset.idx));
   else if(a==='del-service')delRow('service',Number(el.dataset.idx));
   else if(a==='save')saveConfig();
+  else if(a==='change-password')changePassword();
+  else if(a==='rollback')doRollback(el.dataset.id);
+  else if(a==='history-refresh')refreshExtras();
   else if(a==='reload')reloadService();
   else if(a==='filter-type'){S.typeFilter=el.dataset.type;renderTab();}
   else if(a==='log-level'){S.logLevel=el.dataset.level;renderTab();}

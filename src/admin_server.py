@@ -18,12 +18,22 @@ admin_server.py - mdns_responder 的 Web 管理 API（零第三方依赖）
     GET  /api/queries           查询审计日志（有界环形，可 limit）
     GET  /api/browse            局域网服务地图（外来 DNS-SD 摄取）
     GET  /api/conflicts         名称冲突登记（本地同名异值）
+    GET  /api/metrics           Prometheus 文本指标
+    GET  /api/auth              管理员密码状态（是否已设置）
+    GET  /api/config/history    配置版本快照列表
+    GET  /api/alerts            告警编排器状态与统计
+    POST /api/auth/password     设置 / 修改管理员密码
+    POST /api/auth/verify       校验管理员密码
+    POST /api/config/rollback   一键回滚到指定历史版本
     GET  /go/<domain>/<path>     网关：反代到该域名登记的目标；目标不可达/未找到时
                                 返回友好页（非报错栈）
     未知路径 / 目标不可达       友好 404 / 503 页（与控制台同设计语言）
 
 安全：默认仅监听 127.0.0.1；配置 management_token 后所有 API 需带
-      X-Admin-Token 请求头（或 ?token= 查询参数）。网关页与控制台首页同为公开。
+      X-Admin-Token 请求头（或 ?token= 查询参数）。
+      **所有写操作**（改配置 / 回滚 / 改密）额外需要 X-Admin-Password，
+      密码以 PBKDF2 加盐摘要存于 gitignored 的 auth.toml，绝不落明文。
+      网关页与控制台首页同为公开。
 """
 
 from __future__ import annotations
@@ -227,6 +237,10 @@ SERVER_FIELDS = (
     ("audit", bool), ("audit_limit", int),
     ("browse", bool), ("browse_scan_interval", int), ("browse_limit", int),
     ("conflict_detect", bool),
+    # 告警 Webhook / 配置版本历史（mdns_alerts.py / mdns_history.py）
+    ("alert", bool), ("alert_cooldown", int), ("alert_on_health", bool),
+    ("alert_on_conflict", bool), ("alert_timeout", float),
+    ("alert_webhooks", list), ("history_limit", int),
 )
 
 
@@ -249,6 +263,9 @@ def dump_toml(config: dict) -> str:
             lines.append(f"{key} = {int(value)}")
         elif cast is float:
             lines.append(f"{key} = {float(value)}")
+        elif cast is list:
+            items = [str(v) for v in (value or []) if str(v).strip()]
+            lines.append(f"{key} = {json.dumps(items, ensure_ascii=False)}")
         else:
             lines.append(f"{key} = {_toml_str(value)}")
 
@@ -441,7 +458,8 @@ class AdminHandler(BaseHTTPRequestHandler):
     def _cors(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Admin-Token")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, X-Admin-Token, X-Admin-Password")
 
     def _json(self, obj: object, code: int = 200) -> None:
         body = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
@@ -462,6 +480,42 @@ class AdminHandler(BaseHTTPRequestHandler):
         if not supplied:
             supplied = parse_qs(urlparse(self.path).query).get("token", [""])[0]
         return supplied == self.server.token
+
+    def _text(self, body: str, code: int = 200,
+              content_type: str = "text/plain; version=0.0.4; charset=utf-8") -> None:
+        """纯文本响应（Prometheus 指标等）。"""
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self._cors()
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _admin_password(self) -> str:
+        supplied = self.headers.get("X-Admin-Password", "")
+        if not supplied:
+            supplied = parse_qs(urlparse(self.path).query).get(
+                "admin_password", [""])[0]
+        return supplied or ""
+
+    def _require_admin(self) -> bool:
+        """写操作前置校验：未初始化密码 -> 409；密码错误/缺失 -> 403。
+
+        返回 True 表示通过；False 表示响应已发出，调用方应立即 return。
+        """
+        responder = self.server.responder
+        if not responder.auth.enabled:
+            self._json({"error": "尚未设置管理员密码，请先在「安全设置」中初始化",
+                        "code": "setup_required"}, 409)
+            return False
+        if not responder.verify_admin_password(self._admin_password()):
+            self._json({"error": "管理员密码错误或缺失", "code": "auth_failed"}, 403)
+            return False
+        return True
 
     def _body(self) -> dict:
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -618,6 +672,14 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return self._json(responder.insights_browse())
             if path == "/api/conflicts":
                 return self._json(responder.insights_conflicts())
+            if path == "/api/metrics":
+                return self._text(responder.metrics_text())
+            if path == "/api/auth":
+                return self._json(responder.auth_state())
+            if path == "/api/config/history":
+                return self._json(responder.config_history())
+            if path == "/api/alerts":
+                return self._json(responder.alerts_state())
             # 未知路径：给友好 404 页，而不是让人头大的报错栈
             return self._friendly("notfound", domain=path,
                                  detail="管理控制台没有这个地址")
@@ -632,8 +694,32 @@ class AdminHandler(BaseHTTPRequestHandler):
         responder = self.server.responder
         try:
             payload = self._body()
+
+            # -- 管理员密码（首次设置无需旧密码；之后需带 X-Admin-Password）--
+            if path == "/api/auth/password":
+                try:
+                    result = responder.set_admin_password(
+                        self._admin_password(), payload.get("new_password", ""))
+                except PermissionError as exc:
+                    return self._json({"error": str(exc), "code": "auth_failed"}, 403)
+                except ValueError as exc:
+                    return self._json({"error": str(exc), "code": "invalid_password"}, 400)
+                return self._json({"ok": True, **result})
+            if path == "/api/auth/verify":
+                ok = responder.verify_admin_password(self._admin_password())
+                return self._json({"ok": ok, "code": None if ok else "auth_failed"},
+                                  200 if ok else 403)
+
+            # -- 所有变更类操作统一要求管理员密码 --
             if path == "/api/config":
+                if not self._require_admin():
+                    return None
                 return self._json(responder.save_config(payload))
+            if path == "/api/config/rollback":
+                if not self._require_admin():
+                    return None
+                return self._json(responder.rollback_config(str(payload.get("id", ""))))
+
             if path == "/api/reload":
                 responder.request_reload()
                 return self._json({"ok": True, "message": "已触发配置重载"})
@@ -643,6 +729,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             return self._json({"error": "not found", "path": path}, 404)
         except ValueError as exc:
             return self._json({"error": str(exc)}, 400)
+        except FileNotFoundError as exc:
+            return self._json({"error": str(exc)}, 404)
         except Exception as exc:  # noqa: BLE001
             LOG.exception("POST %s 失败", path)
             return self._json({"error": str(exc)}, 500)

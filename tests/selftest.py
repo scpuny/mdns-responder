@@ -311,6 +311,8 @@ port = 8080
 txt = {{ path = "/" }}
 """
 ADMIN_TOKEN = "selftest-token-9527"
+ADMIN_PASSWORD = "selftest-admin-pw-2026"
+ADMIN_PASSWORD_NEW = "selftest-admin-pw-2027"
 
 
 def _free_port() -> int:
@@ -333,10 +335,12 @@ def verify_admin_api() -> None:
         fh.write(ADMIN_CONFIG.format(port=port, admin_port=admin_port, token=ADMIN_TOKEN))
     base = f"http://127.0.0.1:{admin_port}"
 
-    def req(path, method="GET", body=None, auth=True, want_json=True):
+    def req(path, method="GET", body=None, auth=True, want_json=True, pw=None):
         headers = {"Content-Type": "application/json"}
         if auth:
             headers["X-Admin-Token"] = ADMIN_TOKEN
+        if pw:
+            headers["X-Admin-Password"] = pw
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
         try:
@@ -349,9 +353,12 @@ def verify_admin_api() -> None:
         except Exception as exc:  # noqa: BLE001
             return 0, {"error": str(exc)}
 
+    env = os.environ.copy()
+    env["MDNS_AUTH_FILE"] = os.path.join(tmpdir, "auth.toml")
+    env["MDNS_HISTORY_DIR"] = os.path.join(tmpdir, "config_history")
     proc = subprocess.Popen(
         [sys.executable, os.path.join(SRC, "mdns_responder.py"), "-c", cfg_path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
     )
     out = ""
     try:
@@ -435,10 +442,45 @@ def verify_admin_api() -> None:
         code, denied = req("/api/status", auth=False)
         check(code == 401 and "unauthorized" in str(denied), "未带 token 的 API 返回 401")
 
-        # 结构化保存 -> 备份 -> 热重载生效
+        # ---- Prometheus 指标 / 管理员密码 / 告警 / 版本历史 ----
+        code, metrics = req("/api/metrics", want_json=False)
+        check(code == 200 and "mdns_responder_up 1" in metrics
+              and "# TYPE mdns_responder_up gauge" in metrics,
+              "GET /api/metrics 返回 Prometheus 文本指标")
+        code, authst = req("/api/auth")
+        check(code == 200 and authst.get("enabled") is False,
+              "GET /api/auth 返回管理员密码未初始化状态")
+        code, al = req("/api/alerts")
+        check(code == 200 and "stats" in al and al.get("webhooks") == 0,
+              "GET /api/alerts 返回告警编排器状态")
+        code, hist0 = req("/api/config/history")
+        check(code == 200 and "items" in hist0,
+              "GET /api/config/history 返回版本列表")
+        code, blocked = req("/api/config", "POST", {"raw": cfg["raw"]})
+        check(code == 409 and blocked.get("code") == "setup_required",
+              "未设置管理员密码时写操作被拒绝（409）")
+        code, setup = req("/api/auth/password", "POST",
+                          {"new_password": ADMIN_PASSWORD})
+        check(code == 200 and setup.get("ok") and setup.get("enabled"),
+              "首次设置管理员密码成功")
+        code, verify = req("/api/auth/verify", "POST", {}, pw=ADMIN_PASSWORD)
+        check(code == 200 and verify.get("ok") is True, "正确管理员密码校验通过")
+        code, verify_bad = req("/api/auth/verify", "POST", {}, pw="wrong-pw")
+        check(code == 403, "错误管理员密码校验返回 403")
+        code, weak = req("/api/auth/password", "POST",
+                         {"new_password": "123"}, pw=ADMIN_PASSWORD)
+        check(code == 400 and weak.get("code") == "invalid_password",
+              "过短新密码被拒绝")
+        code, wrongpw = req("/api/config", "POST", {"raw": cfg["raw"]},
+                            pw="wrong-pw")
+        check(code == 403 and wrongpw.get("code") == "auth_failed",
+              "密码错误时写操作被拒绝（403）")
+
+        # 结构化保存 -> 备份 -> 热重载生效（需管理员密码）
         new_cfg = cfg["config"]
         new_cfg["hosts"].append({"name": "printer.local", "ip": "172.15.103.77"})
-        code, saved = req("/api/config", "POST", {"config": new_cfg})
+        code, saved = req("/api/config", "POST", {"config": new_cfg},
+                          pw=ADMIN_PASSWORD)
         check(code == 200 and saved.get("ok") is True, "POST /api/config 结构化保存成功")
         check(os.path.isfile(cfg_path + ".bak"), "保存前生成 config.toml.bak 备份")
         time.sleep(1.2)
@@ -447,7 +489,9 @@ def verify_admin_api() -> None:
                   for r in rec2.get("items", [])),
               "保存后热重载生效，新域名已发布")
 
-        code, bad = req("/api/config", "POST", {"raw": '[server]\nport = 5353\n\n[[hosts]]\nname = "x.local"\nip = "not-an-ip"\n'})
+        code, bad = req("/api/config", "POST", {
+            "raw": '[server]\nport = 5353\n\n[[hosts]]\nname = "x.local"\nip = "not-an-ip"\n'
+        }, pw=ADMIN_PASSWORD)
         check(code == 400, "非法配置被拒绝（HTTP 400）")
         code, rec3 = req("/api/records")
         check(any(r["name"] == "printer.local" for r in rec3.get("items", [])),
@@ -455,6 +499,44 @@ def verify_admin_api() -> None:
 
         code, reload_result = req("/api/reload", "POST", {})
         check(code == 200 and reload_result.get("ok") is True, "POST /api/reload 手动重载")
+
+        # ---- 配置版本历史 + 一键回滚 ----
+        code, hist1 = req("/api/config/history")
+        check(hist1["count"] >= 1, "保存配置自动生成版本快照")
+        code, cfg_now = req("/api/config")
+        cfg2 = cfg_now["config"]
+        cfg2["hosts"] = [h for h in cfg2["hosts"]
+                         if h["name"] != "printer.local"]
+        code, saved2 = req("/api/config", "POST", {"config": cfg2},
+                           pw=ADMIN_PASSWORD)
+        check(code == 200 and saved2.get("ok"), "第二次保存成功（移除域名）")
+        time.sleep(1.2)
+        code, rec_mid = req("/api/records")
+        check(not any(r["name"] == "printer.local" for r in rec_mid["items"]),
+              "第二次保存后域名已移除")
+        code, hist2 = req("/api/config/history")
+        target = hist2["items"][0]["id"]
+        code, rb = req("/api/config/rollback", "POST", {"id": target},
+                       pw=ADMIN_PASSWORD)
+        check(code == 200 and rb.get("ok")
+              and rb.get("rolled_back_to") == target,
+              "POST /api/config/rollback 一键回滚成功")
+        time.sleep(1.2)
+        code, rec_back = req("/api/records")
+        check(any(r["name"] == "printer.local" for r in rec_back["items"]),
+              "回滚后配置恢复（printer.local 重新发布）")
+        code, badid = req("/api/config/rollback", "POST",
+                          {"id": "../../etc/passwd"}, pw=ADMIN_PASSWORD)
+        check(code == 400, "非法版本 ID 被拒绝（防路径穿越）")
+
+        # ---- 修改管理员密码 ----
+        code, chp = req("/api/auth/password", "POST",
+                        {"new_password": ADMIN_PASSWORD_NEW}, pw=ADMIN_PASSWORD)
+        check(code == 200 and chp.get("ok"), "修改管理员密码成功")
+        code, old_bad = req("/api/auth/verify", "POST", {}, pw=ADMIN_PASSWORD)
+        check(code == 403, "旧密码立即失效")
+        code, new_ok = req("/api/auth/verify", "POST", {}, pw=ADMIN_PASSWORD_NEW)
+        check(code == 200 and new_ok.get("ok"), "新密码生效")
     finally:
         proc.terminate()
         try:
@@ -634,6 +716,175 @@ def insights() -> None:
           "tcp_probe 返回 (bool, 非负 ms)")
 
 
+def platform_features() -> None:
+    """管理密码 / 版本历史 / 告警 / Prometheus —— 纯逻辑离线测试。"""
+    import json
+    print("\n[12] 管理密码 / 版本历史 / 告警 / Prometheus（纯逻辑）")
+    from mdns_security import AuthManager, validate_password
+    from mdns_history import ConfigHistory
+    from mdns_alerts import AlertManager, build_payload, infer_platform
+    from mdns_responder import format_metrics
+    from admin_server import dump_toml, merge_server
+
+    tmp = tempfile.mkdtemp(prefix="mdns-platform-")
+
+    # --- 管理员密码：加盐摘要 / 常量时间 / 改密 / 重启可加载 ---------------
+    auth_path = os.path.join(tmp, "auth.toml")
+    auth = AuthManager(path=auth_path)
+    check(not auth.enabled, "初始未设置管理员密码")
+    check(not auth.verify("whatever"), "未启用时任何密码都校验失败")
+    try:
+        validate_password("short")
+        check(False, "过短密码应被拒绝")
+    except ValueError:
+        check(True, "过短密码被拒绝（至少 8 位）")
+    auth.set_password("correct-horse-9527")
+    check(auth.enabled, "首次设置密码后启用")
+    check(auth.verify("correct-horse-9527"), "正确密码校验通过")
+    check(not auth.verify("wrong"), "错误密码校验失败")
+    with open(auth_path, "r", encoding="utf-8") as fh:
+        raw = fh.read()
+    check("correct-horse-9527" not in raw, "auth.toml 不含明文密码")
+    check("pbkdf2_sha256" in raw and "salt" in raw, "auth.toml 含算法与随机盐")
+    check(oct(os.stat(auth_path).st_mode & 0o777) == "0o600", "auth.toml 权限 0600")
+    reopened = AuthManager(path=auth_path)
+    check(reopened.enabled and reopened.verify("correct-horse-9527"),
+          "重新加载 auth.toml 后密码仍有效")
+    try:
+        reopened.set_password("new-password-123", "wrong-old")
+        check(False, "旧密码错误应被拒绝")
+    except PermissionError:
+        check(True, "改密时旧密码错误被拒绝")
+    reopened.set_password("new-password-123", "correct-horse-9527")
+    check(reopened.verify("new-password-123")
+          and not reopened.verify("correct-horse-9527"), "改密后旧密码立即失效")
+
+    # --- 配置版本历史：有界 / 读回 / 防穿越 --------------------------------
+    hist = ConfigHistory(directory=os.path.join(tmp, "history"), limit=3)
+    for i in range(5):
+        hist.save(f"# version {i}\n[server]\nport = 5353\n", reason="before-save")
+    items = hist.list()
+    check(len(items) == 3, "历史快照有界保留（limit=3）")
+    check(items[0]["reason"] == "before-save", "历史元数据含来源")
+    check(hist.get(items[0]["id"]).startswith("# version"), "按 ID 可读回 TOML 原文")
+    try:
+        hist.get("../../etc/passwd")
+        check(False, "非法 ID 应被拒绝")
+    except ValueError:
+        check(True, "非法版本 ID 被拒绝（防路径穿越）")
+    try:
+        hist.get("config-20000101T000000Z-abcdef-1234.json")
+        check(False, "不存在的版本应报错")
+    except FileNotFoundError:
+        check(True, "不存在的版本返回 FileNotFoundError")
+
+    # --- 告警：平台识别 / 载荷 / 状态翻转 / 冷却 / 失败计数 ----------------
+    sent: list = []
+
+    def fake_sender(url, body, timeout):
+        sent.append((url, json.loads(body.decode("utf-8"))))
+
+    alerts = AlertManager(
+        webhooks=["https://oapi.dingtalk.com/robot/send?access_token=x",
+                  "https://hooks.slack.com/services/xxx",
+                  "https://example.com/hook"],
+        cooldown=0, timeout=1, sender=fake_sender)
+    check(infer_platform("https://open.feishu.cn/open-apis/bot/v2/hook/x") == "feishu",
+          "飞书平台按 URL 识别")
+    check(infer_platform("https://qyapi.weixin.qq.com/cgi-bin/webhook/send") == "wecom",
+          "企业微信平台按 URL 识别")
+    check(infer_platform("https://example.com/hook") == "generic",
+          "未知 URL 走通用 JSON")
+    ding = json.loads(build_payload(
+        "dingtalk", {"title": "t", "detail": "d", "level": "critical",
+                     "time": "now"}).decode("utf-8"))
+    check(ding["msgtype"] == "markdown" and "t" in ding["markdown"]["text"],
+          "钉钉 markdown 载荷正确")
+    generic = json.loads(build_payload(
+        "generic", {"kind": "health", "title": "t", "detail": "d",
+                    "level": "info", "ts": 1}).decode("utf-8"))
+    check(generic["source"] == "mdns-responder" and generic["kind"] == "health",
+          "通用 JSON 载荷含来源与事件类型")
+    base = {"key": "host:nas.local", "label": "nas.local",
+            "target": "172.15.103.30:80", "status": "up",
+            "latency_ms": 3, "failures": 0}
+    check(alerts.check_health([base]) == 0, "首次探测只记基线，不告警")
+    down = dict(base, status="down", failures=1)
+    check(alerts.check_health([down]) == 1, "up -> down 触发一次告警")
+    check(alerts.check_health([down]) == 0, "状态未变化不重复告警")
+    deadline = time.time() + 3
+    while len(sent) < 3 and time.time() < deadline:
+        time.sleep(0.02)
+    check(len(sent) == 3, "告警异步投递到 3 个 webhook")
+    check(alerts.state()["stats"]["sent"] == 3, "告警 sent 统计正确")
+    check(alerts.emit_conflict("nas.local", "192.168.1.9", "172.16.5.9:5353"),
+          "名称冲突告警入队")
+    cold = AlertManager(webhooks=[], cooldown=100, sender=fake_sender)
+    check(cold.emit("health", "k", "t", "d") is True, "首次事件登记成功")
+    check(cold.emit("health", "k", "t", "d") is False, "冷却窗口内重复事件被去重")
+
+    def bad_sender(url, body, timeout):
+        raise OSError("boom")
+
+    failing = AlertManager(webhooks=["https://example.com/hook"],
+                           cooldown=0, sender=bad_sender)
+    failing.emit("test", "k2", "t", "d")
+    deadline = time.time() + 4
+    while failing.state()["stats"]["failed"] == 0 and time.time() < deadline:
+        time.sleep(0.02)
+    check(failing.state()["stats"]["failed"] == 1, "webhook 发送失败被计数")
+    alerts.stop()
+    cold.stop()
+    failing.stop()
+
+    # --- TOML 序列化：新字段（数组 / 浮点 / 布尔）--------------------------
+    text = dump_toml({
+        "server": {"port": 5353, "alert": True, "alert_timeout": 5.0,
+                   "alert_webhooks": ["https://a", "https://b"]},
+        "hosts": [], "services": []})
+    check('alert_webhooks = ["https://a", "https://b"]' in text,
+          "TOML 序列化支持 webhook 字符串数组")
+    check("alert_timeout = 5.0" in text and "alert = true" in text,
+          "TOML 序列化支持新增浮点 / 布尔字段")
+    merged = merge_server(text, {"port": 5454})
+    check(merged["alert_webhooks"] == ["https://a", "https://b"]
+          and merged["port"] == 5454,
+          "merge_server 保留表单未提交的新字段")
+
+    # --- Prometheus 文本 ---------------------------------------------------
+    status = {
+        "running": True, "uptime": 123, "records": 13, "hosts": 2,
+        "services": 2, "ttl": 120,
+        "stats": {"queries": 10, "responses": 9, "bytes": 1000, "announces": 2},
+        "insights": {"audit": {"total": 10}, "browse": {"instances": 5},
+                     "conflicts": {"count": 1}},
+        "security": {"admin_password_enabled": True},
+        "history": {"count": 2, "limit": 30},
+        "logging": {"max_disk_bytes": 1024},
+        "config_saves": 3,
+    }
+    extra = {
+        "health_items": [
+            dict(base, kind="host"),
+            {"key": "svc:0:x", "label": "bad", "target": "1.2.3.4:9",
+             "kind": "service", "status": "down", "latency_ms": None},
+        ],
+        "alerts": {"enabled": True, "webhooks": 2, "queued": 0,
+                   "stats": {"events": 3, "sent": 3, "failed": 0, "dropped": 0}},
+    }
+    metrics = format_metrics(status, extra)
+    check("mdns_responder_up 1" in metrics
+          and "# TYPE mdns_responder_up gauge" in metrics,
+          "指标含 HELP / TYPE 与 up 值")
+    check('mdns_responder_health_status{target="nas.local"' in metrics
+          and "mdns_responder_health_down 1" in metrics,
+          "指标含带标签的健康状态与聚合计数")
+    check("mdns_responder_alert_sent_total 3" in metrics
+          and "mdns_responder_config_saves_total 3" in metrics,
+          "指标含告警与配置写入计数")
+    check(metrics.endswith("\n"), "指标以换行结束")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--offline", action="store_true", help="仅运行离线报文测试")
@@ -642,6 +893,7 @@ def main() -> int:
     args = parser.parse_args()
     offline()
     insights()
+    platform_features()
     log_rotation()
     friendly_page()
     if not args.offline:

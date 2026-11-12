@@ -81,6 +81,29 @@ conflict_detect = true
 
 
 # -----------------------------------------------------------------------------
+# 告警 Webhook（mdns_alerts）—— 健康状态翻转 / 名称冲突
+#
+#   alert_webhooks 里每个元素一个 URL，平台按域名自动识别：
+#     钉钉 oapi.dingtalk.com · 飞书 open.feishu.cn · Slack hooks.slack.com
+#     企业微信 qyapi.weixin.qq.com · 其它一律通用 JSON
+#   同一事件在 alert_cooldown 秒内只发一次，避免网络抖动刷屏。
+#   未配置 webhook 时事件仍会登记（GET /api/alerts 可查），但不会向外投递。
+# -----------------------------------------------------------------------------
+alert = true
+alert_cooldown = 300        # 事件冷却（秒），0 = 不去重
+alert_on_health = true      # up -> down / down -> up 触发
+alert_on_conflict = true    # 名称冲突触发
+alert_timeout = 5.0         # 单次 webhook 超时（0.5..30 秒）
+alert_webhooks = []         # 例：["https://oapi.dingtalk.com/robot/send?access_token=xxx"]
+
+# -----------------------------------------------------------------------------
+# 配置版本历史（mdns_history）—— 每次保存 / 回滚前自动快照到 logs/config_history/
+# 管理台「配置管理」页可查看并一键回滚；history_limit 是有界保留份数。
+# -----------------------------------------------------------------------------
+history_limit = 30
+
+
+# -----------------------------------------------------------------------------
 # 纯域名 -> IP 映射（生成 A 记录；写 IPv6 地址则生成 AAAA 记录）
 # -----------------------------------------------------------------------------
 [[hosts]]

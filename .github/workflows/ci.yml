@@ -2,7 +2,8 @@
 #
 # 每次 push / PR 到 main：
 #   1. 语法校验（py_compile 全部 Python / bash -n 全部脚本 / node --check 前端内联 JS）
-#   2. 完整自测（tests/selftest.py：离线报文 + 真实组播端到端 + 管理 API + 可观测 + 网关）
+#   2. Compose 校验（host 网络硬约束 + docker compose config）
+#   3. 完整自测（tests/selftest.py：离线报文 + 真实组播端到端 + 管理 API + 可观测 + 网关 + 安全/历史/告警/指标）
 #
 # 说明：自测会真实绑定 5353 组播 socket 并收发本机组播报文，
 # 在 GitHub Runner（临时容器）内可正常执行，且不会影响外部网络。
@@ -29,8 +30,11 @@ jobs:
 
       - name: Syntax check (py_compile + bash -n + node --check)
         run: |
-          python -m py_compile src/mdns_responder.py src/mdns_insights.py src/admin_server.py src/mdns_probe.py tests/selftest.py
-          bash -n start.sh install.sh
+          python -m py_compile \
+            src/mdns_responder.py src/mdns_insights.py src/admin_server.py \
+            src/mdns_probe.py src/mdns_security.py src/mdns_history.py \
+            src/mdns_alerts.py tests/selftest.py
+          bash -n start.sh install.sh deploy/docker-entrypoint.sh
           # 前端单文件内联 JS 语法校验（需 node；Runner 预装）
           python - <<'PY'
           import re
@@ -40,9 +44,25 @@ jobs:
           PY
           node --check /tmp/_inline.js
 
+      - name: Compose config validation
+        run: |
+          # host 网络是 mDNS 组播的硬性要求，防止后续改动误改回 bridge
+          python - <<'PY'
+          text = open('docker-compose.yml', encoding='utf-8').read()
+          assert 'network_mode: host' in text, 'compose 必须使用 host 网络'
+          assert './data:/data' in text, 'compose 必须持久化 /data'
+          print('COMPOSE ASSERT OK')
+          PY
+          if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+            docker compose config -q && echo 'docker compose config OK'
+          else
+            echo 'docker compose 不可用，跳过（已做静态断言）'
+          fi
+
       - name: Full self-test (offline + multicast e2e + admin API)
         run: |
           # start.sh --test = python3 tests/selftest.py --standard-port
-          # 89 个断言：离线报文编解码 / 真实组播收发 / QU 单播 / 热重载 /
-          # goodbye / 5353 共存 / 管理 API(REST+SSE+鉴权) / 可观测四路由 / 网关友好页 / 日志轮转
+          # 146 个断言：离线报文 / 真实组播 / QU 单播 / 热重载 / goodbye / 5353 共存 /
+          # 管理 API(REST+SSE+鉴权) / 可观测四路由 / Prometheus / 管理员密码 /
+          # 配置版本回滚 / 告警编排 / 网关友好页 / 日志轮转
           bash start.sh --test

@@ -320,6 +320,15 @@ class ServerConfig:
     browse_scan_interval: int = 45   # 主动枚举查询周期（秒）；0 = 只被动摄取
     browse_limit: int = 400          # 服务地图保留实例数
     conflict_detect: bool = True     # 本地同名异值外来 RR 登记为冲突
+    # 告警 Webhook（mdns_alerts.py）：健康翻转 / 名称冲突 -> 钉钉 / 飞书 / Slack / 企微 / 通用
+    alert: bool = True               # 总开关（未配置 webhook 时事件只登记不投递）
+    alert_cooldown: int = 300        # 同一事件冷却秒数（去重）
+    alert_on_health: bool = True     # 健康状态翻转触发
+    alert_on_conflict: bool = True   # 名称冲突触发
+    alert_timeout: float = 5.0       # 单次 webhook 超时（秒）
+    alert_webhooks: list[str] = field(default_factory=list)
+    # 配置版本历史（mdns_history.py）：保存前快照，可一键回滚
+    history_limit: int = 30          # 保留快照份数（有界）
 
     def validate(self) -> None:
         if self.log_max_bytes < 1024:
@@ -355,6 +364,15 @@ class ServerConfig:
             raise ConfigError("server.browse_scan_interval 必须 >= 0")
         if self.browse_limit < 10:
             raise ConfigError("server.browse_limit 必须 >= 10")
+        if self.alert_cooldown < 0:
+            raise ConfigError("server.alert_cooldown 必须 >= 0")
+        if self.alert_timeout < 0.5 or self.alert_timeout > 30:
+            raise ConfigError("server.alert_timeout 必须在 0.5..30 秒")
+        if self.history_limit < 1:
+            raise ConfigError("server.history_limit 必须 >= 1")
+        for url in self.alert_webhooks:
+            if not url.lower().startswith(("http://", "https://")):
+                raise ConfigError(f"server.alert_webhooks 必须是 http(s) URL: {url!r}")
         try:
             socket.inet_aton(self.group)
         except OSError as exc:
@@ -412,6 +430,30 @@ def _as_bool(value: object, field_name: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigError(f"{field_name} 必须是 true / false")
     return value
+
+
+def _as_float(value: object, field_name: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{field_name} 必须是数值")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{field_name} 必须是数值，实际为 {value!r}") from exc
+
+
+def _as_str_list(value: object, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ConfigError(f"{field_name} 必须是字符串数组")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigError(f"{field_name} 的每一项都必须是字符串")
+        text = item.strip()
+        if text:
+            out.append(text)
+    return out
 
 
 def _validate_ip(value: object, field_name: str) -> str:
@@ -475,6 +517,19 @@ def load_config(path: str) -> Config:
                              "server.browse_limit"),
         conflict_detect=_as_bool(server_raw.get("conflict_detect", True),
                                  "server.conflict_detect"),
+        alert=_as_bool(server_raw.get("alert", True), "server.alert"),
+        alert_cooldown=_as_int(server_raw.get("alert_cooldown", 300),
+                               "server.alert_cooldown"),
+        alert_on_health=_as_bool(server_raw.get("alert_on_health", True),
+                                 "server.alert_on_health"),
+        alert_on_conflict=_as_bool(server_raw.get("alert_on_conflict", True),
+                                   "server.alert_on_conflict"),
+        alert_timeout=_as_float(server_raw.get("alert_timeout", 5.0),
+                                "server.alert_timeout"),
+        alert_webhooks=_as_str_list(server_raw.get("alert_webhooks", []),
+                                    "server.alert_webhooks"),
+        history_limit=_as_int(server_raw.get("history_limit", 30),
+                              "server.history_limit"),
     )
     server.validate()
 
@@ -929,6 +984,20 @@ class Responder:
             if srv.health else None)
         if self.health is not None and srv.health_interval > 0:
             self.health.start()
+        # 安全 / 版本历史 / 告警编排（均为进程内零依赖组件）
+        from mdns_security import AuthManager
+        from mdns_history import ConfigHistory
+        from mdns_alerts import AlertManager
+        self.auth = AuthManager()
+        self.history = ConfigHistory(limit=srv.history_limit)
+        self.alerts = AlertManager(
+            webhooks=srv.alert_webhooks, cooldown=srv.alert_cooldown,
+            timeout=srv.alert_timeout, on_health=srv.alert_on_health,
+            on_conflict=srv.alert_on_conflict, enabled=srv.alert)
+        self.config_saves = 0
+        LOG.info("管理员密码：%s（auth.toml %s）",
+                 "已启用" if self.auth.enabled else "尚未设置",
+                 self.auth.path)
         self._reset_periodic()
 
     def _refresh_local_values(self) -> None:
@@ -1030,7 +1099,22 @@ class Responder:
                     if self.conflicts else 0,
                 },
             },
+            "security": {
+                "admin_password_enabled": self.auth.enabled,
+                "auth_updated_at": self.auth.state().get("updated_at", ""),
+            },
+            "history": {
+                "limit": srv.history_limit,
+                "count": len(self.history.list()),
+            },
+            "alerts": {
+                "enabled": srv.alert,
+                "webhooks": len(srv.alert_webhooks),
+                "sent": self.alerts.state()["stats"]["sent"],
+                "failed": self.alerts.state()["stats"]["failed"],
+            },
             "stats": dict(self.stats),
+            "config_saves": self.config_saves,
             "config_path": self.config_path,
         }
 
@@ -1106,6 +1190,12 @@ class Responder:
                     "browse": srv.browse, "browse_scan_interval": srv.browse_scan_interval,
                     "browse_limit": srv.browse_limit,
                     "conflict_detect": srv.conflict_detect,
+                    "alert": srv.alert, "alert_cooldown": srv.alert_cooldown,
+                    "alert_on_health": srv.alert_on_health,
+                    "alert_on_conflict": srv.alert_on_conflict,
+                    "alert_timeout": srv.alert_timeout,
+                    "alert_webhooks": list(srv.alert_webhooks),
+                    "history_limit": srv.history_limit,
                 },
                 "hosts": [{"name": h.name, "ip": h.ip} for h in self.cfg.hosts],
                 "services": [{
@@ -1129,9 +1219,12 @@ class Responder:
             text = dump_toml(cfg)
         else:
             raise ConfigError("请求体需包含 raw 或 config")
+        return self._apply_config_text(text, reason="save")
+
+    def _apply_config_text(self, text: str, reason: str = "save") -> dict:
+        """在线保存 / 版本回滚共用的唯一写入链路：先快照、再校验、最后原子替换。"""
         if not text.endswith("\n"):
             text += "\n"
-
         tmp_path = self.config_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -1144,13 +1237,21 @@ class Responder:
             except OSError:
                 pass
             raise
+        # 写入前先把「当前生效版本」存入历史，保证每次变更都可一键回滚
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as fh:
+                old_raw = fh.read()
+            self.history.save(old_raw, reason=f"before-{reason}")
+        except (OSError, ValueError) as exc:
+            LOG.warning("配置历史快照失败（仍继续保存）: %s", exc)
         try:
             shutil.copy2(self.config_path, self.config_path + ".bak")
         except OSError as exc:
             LOG.warning("配置备份失败（仍继续保存）: %s", exc)
         os.replace(tmp_path, self.config_path)
         self.reload_requested = True
-        LOG.info("管理界面已保存配置，等待热重载（%d 条记录）", len(new_records))
+        self.config_saves += 1
+        LOG.info("配置已写入（%s），等待热重载（%d 条记录）", reason, len(new_records))
         return {
             "ok": True,
             "message": "配置已保存并触发热重载",
@@ -1162,6 +1263,38 @@ class Responder:
                 or new_cfg.server.port != self.cfg.server.port
             ),
         }
+
+    # ------------------------------------------------------------------
+    # 管理员密码 / 配置版本历史 / 告警 / Prometheus
+    # ------------------------------------------------------------------
+    def auth_state(self) -> dict:
+        return self.auth.state()
+
+    def set_admin_password(self, old_password: object,
+                           new_password: object) -> dict:
+        return self.auth.set_password(new_password, old_password)
+
+    def verify_admin_password(self, password: object) -> bool:
+        return self.auth.verify(password)
+
+    def config_history(self) -> dict:
+        return self.history.json()
+
+    def rollback_config(self, version_id: str) -> dict:
+        text = self.history.get(version_id)
+        result = self._apply_config_text(text, reason="rollback")
+        result["message"] = f"已回滚到版本 {version_id}，等待热重载"
+        result["rolled_back_to"] = version_id
+        return result
+
+    def alerts_state(self) -> dict:
+        return self.alerts.state()
+
+    def metrics_text(self) -> str:
+        return format_metrics(self.status(), {
+            "health_items": self.health.items() if self.health else [],
+            "alerts": self.alerts.state(),
+        })
 
     def interfaces(self) -> list[str]:
         return list(dict.fromkeys(["0.0.0.0", "all"] + _local_ipv4_interfaces()))
@@ -1265,6 +1398,14 @@ class Responder:
         self._refresh_local_values()
         self._refresh_browse_scan()
         self._sync_health_thread()
+        self.alerts.configure(
+            webhooks=new_cfg.server.alert_webhooks,
+            enabled=new_cfg.server.alert,
+            cooldown=new_cfg.server.alert_cooldown,
+            timeout=new_cfg.server.alert_timeout,
+            on_health=new_cfg.server.alert_on_health,
+            on_conflict=new_cfg.server.alert_on_conflict)
+        self.history.limit = new_cfg.server.history_limit
         if server_changed:
             LOG.warning("server.interface/group/port 变更需重启进程才能生效")
         self._reset_periodic()
@@ -1314,6 +1455,7 @@ class Responder:
                 if local is not None and rr["value"] not in local:
                     self.conflicts.ingest(rr["type"], rr["name"], rr["value"],
                                           rr["from"])
+                    self.alerts.emit_conflict(rr["name"], rr["value"], rr["from"])
             if self.browse is not None:
                 self.browse.ingest(rr["type"], rr["name"], rr["value"],
                                    rr["ttl"], rr["from"], ours)
@@ -1406,6 +1548,9 @@ class Responder:
             now = time.monotonic()
             if self.reload_requested:
                 self.reload(force=True)
+            # 健康状态翻转检测：只在状态真正变化时投递告警，内部有冷却去重
+            if self.health is not None:
+                self.alerts.check_health(self.health.items())
 
             if self.pending_bursts > 0 and now >= self.next_burst_at:
                 self._announce()
@@ -1450,6 +1595,7 @@ class Responder:
             self.net.close()
         if self.health is not None:
             self.health.stop()
+        self.alerts.stop()
         LOG.info("已停止")
         return 0
 
@@ -1458,6 +1604,92 @@ class Responder:
 
     def _on_hup(self, _signum, _frame) -> None:
         self.reload_requested = True
+
+
+# ---------------------------------------------------------------------------
+# Prometheus 文本指标（/api/metrics）
+# ---------------------------------------------------------------------------
+def _prom_label(value: object) -> str:
+    text = str(value if value is not None else "")
+    return (text.replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\n", "\\n"))
+
+
+def format_metrics(status: dict, extra: dict | None = None) -> str:
+    """把 status() 的快照渲染成 Prometheus 0.0.4 文本格式（纯函数，便于离线单测）。"""
+    extra = extra or {}
+    lines: list[str] = []
+
+    def emit(name: str, kind: str, help_text: str, value) -> None:
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} {kind}")
+        lines.append(f"{name} {value}")
+
+    stats = status.get("stats", {}) or {}
+    insights = status.get("insights", {}) or {}
+    security = status.get("security", {}) or {}
+    history = status.get("history", {}) or {}
+    alerts = (extra.get("alerts") or status.get("alerts") or {})
+    alert_stats = alerts.get("stats", {}) or {}
+    health_items = extra.get("health_items") or []
+
+    emit("mdns_responder_up", "gauge", " responder 主循环是否运行中", 1 if status.get("running") else 0)
+    emit("mdns_responder_uptime_seconds", "gauge", "进程运行时长（秒）", status.get("uptime", 0))
+    emit("mdns_responder_records", "gauge", "当前发布的 DNS 记录数", status.get("records", 0))
+    emit("mdns_responder_hosts", "gauge", "配置的域名映射数", status.get("hosts", 0))
+    emit("mdns_responder_services", "gauge", "配置的服务发布数", status.get("services", 0))
+    emit("mdns_responder_ttl_seconds", "gauge", "发布记录的 TTL（秒）", status.get("ttl", 0))
+    for key, metric in (("queries", "queries_total"), ("responses", "responses_total"),
+                        ("bytes", "response_bytes_total"), ("announces", "announces_total")):
+        emit(f"mdns_responder_{metric}", "counter", f"累计 {key}", stats.get(key, 0))
+
+    counts = {"up": 0, "down": 0, "unknown": 0}
+    for item in health_items:
+        s = item.get("status", "unknown")
+        if s in counts:
+            counts[s] += 1
+    emit("mdns_responder_health_targets", "gauge", "健康探测目标总数", len(health_items))
+    for s, n in counts.items():
+        emit(f"mdns_responder_health_{s}", "gauge", f"状态为 {s} 的目标数", n)
+    lines.append("# HELP mdns_responder_health_status 单个目标是否在线（1=up, 0=down/unknown）")
+    lines.append("# TYPE mdns_responder_health_status gauge")
+    for item in health_items:
+        label = _prom_label(item.get("label", ""))
+        address = _prom_label(item.get("target", ""))
+        kind = _prom_label(item.get("kind", ""))
+        lines.append(
+            f'mdns_responder_health_status{{target="{label}",address="{address}",'
+            f'kind="{kind}"}} {1 if item.get("status") == "up" else 0}')
+        if item.get("latency_ms") is not None:
+            lines.append(
+                f'mdns_responder_health_latency_ms{{target="{label}"}} '
+                f'{item.get("latency_ms")}')
+
+    emit("mdns_responder_queries_audited_total", "counter", "审计日志累计查询数",
+         (insights.get("audit", {}) or {}).get("total", 0))
+    emit("mdns_responder_browse_instances", "gauge", "局域网服务地图实例数",
+         (insights.get("browse", {}) or {}).get("instances", 0))
+    emit("mdns_responder_conflicts", "gauge", "当前登记的名称冲突数",
+         (insights.get("conflicts", {}) or {}).get("count", 0))
+    emit("mdns_responder_config_saves_total", "counter", "管理台配置写入次数",
+         status.get("config_saves", 0))
+    emit("mdns_responder_config_history_versions", "gauge", "保留的配置快照数",
+         history.get("count", 0))
+    emit("mdns_responder_admin_password_enabled", "gauge", "是否已设置管理员密码",
+         1 if security.get("admin_password_enabled") else 0)
+    emit("mdns_responder_alerts_enabled", "gauge", "告警总开关",
+         1 if alerts.get("enabled") else 0)
+    emit("mdns_responder_alert_webhooks", "gauge", "已配置 webhook 数",
+         alerts.get("webhooks", 0))
+    for key, name in (("events", "events_total"), ("sent", "sent_total"),
+                      ("failed", "failed_total"), ("dropped", "dropped_total")):
+        emit(f"mdns_responder_alert_{name}", "counter", f"告警 {key} 累计",
+             alert_stats.get(key, 0))
+    emit("mdns_responder_alert_queue_depth", "gauge", "告警待发队列长度",
+         alerts.get("queued", 0))
+    emit("mdns_responder_log_max_disk_bytes", "gauge", "日志文件磁盘占用硬上界",
+         (status.get("logging", {}) or {}).get("max_disk_bytes", 0))
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------

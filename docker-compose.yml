@@ -1,0 +1,24 @@
+# mDNS Responder —— Docker Compose
+#
+# 启动：  docker compose up -d --build
+# 日志：  docker compose logs -f
+# 管理台：http://127.0.0.1:8765/
+#
+# 关键：必须 network_mode: host。mDNS 走 224.0.0.251:5353 二层组播，
+#       bridge 网络无法收发，也无法让局域网客户端直连应答里的目标 IP。
+#       host 网络下 [server].management_host = "127.0.0.1" 仍可从宿主机访问。
+services:
+  mdns-responder:
+    build: .
+    image: mdns-responder:local
+    container_name: mdns-responder
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      # 密码摘要与配置历史放在持久化卷，升级 / 重建容器不丢失
+      MDNS_AUTH_FILE: /data/auth.toml
+      MDNS_HISTORY_DIR: /data/config_history
+    volumes:
+      - ./data:/data          # config.toml / auth.toml / config_history/
+      - ./logs:/app/logs      # 有界轮转日志
