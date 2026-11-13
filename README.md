@@ -7,7 +7,7 @@
 > 并提供一个可在线编辑配置、实时观测局域网服务状态的 Web 控制台。
 
 > **项目状态（2026-11-13）**：本项目已进入 **维护阶段**，仅接受缺陷修复与安全补丁，**不再接收新需求**。
-> 后续演进由 [Lan Studio 生态](https://github.com/scpuny/lan-studio) 承接，完整规格见 [Lan Studio PRD](docs/lan-studio-prd.md)。
+> 后续演进由工作区根目录下的 **Lan Studio** 项目承接，完整规格见 `lan-studio/docs/PRD.md`（已迁出本仓库）。
 
 - **零依赖**：仅用 Python 3.11+ 标准库（`socket` / `struct` / `tomllib` / `http.server` / `collections`），手写 DNS 报文编解码，无需 pip、无需构建。
 - **即装即用**：`curl | bash` 一行安装、一行升级，或 clone 后 `./start.sh` 直接跑，也可用 Docker Compose 部署。
