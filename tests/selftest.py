@@ -334,6 +334,9 @@ def verify_admin_api() -> None:
     with open(cfg_path, "w", encoding="utf-8") as fh:
         fh.write(ADMIN_CONFIG.format(port=port, admin_port=admin_port, token=ADMIN_TOKEN))
     base = f"http://127.0.0.1:{admin_port}"
+    # 本地管理接口必须直连：开发机常设 http_proxy 且未配 no_proxy，
+    # 否则 urllib 会把 127.0.0.1 的请求发给代理，拿回 HTML 错误页导致 JSON 解析失败。
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def req(path, method="GET", body=None, auth=True, want_json=True, pw=None):
         headers = {"Content-Type": "application/json"}
@@ -344,7 +347,7 @@ def verify_admin_api() -> None:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=6) as resp:
+            with opener.open(request, timeout=6) as resp:
                 raw = resp.read().decode("utf-8", "replace")
                 return resp.status, (json.loads(raw) if want_json else raw)
         except urllib.error.HTTPError as exc:

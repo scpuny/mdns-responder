@@ -244,6 +244,23 @@ select.inp{appearance:none;background-image:linear-gradient(45deg,transparent 50
 .log-msg{color:var(--term-ink)}
 .controls{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:14px}
 
+/* 配置页子分区 tab：所有面板常驻 DOM，按类别显示，缩短页面 */
+.subtabs{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px;
+  border-radius:16px;border:1px solid var(--line);background:var(--shell);
+  box-shadow:var(--inset);margin-bottom:18px}
+.subtab{display:inline-flex;align-items:center;gap:7px;padding:9px 14px;border-radius:11px;
+  border:1px solid transparent;background:transparent;color:var(--ink-2);
+  font-family:inherit;font-size:12px;font-weight:650;line-height:1;white-space:nowrap;cursor:pointer;
+  transition:color .45s cubic-bezier(.32,.72,0,1),background .45s cubic-bezier(.32,.72,0,1),
+             border-color .45s cubic-bezier(.32,.72,0,1),transform .45s cubic-bezier(.32,.72,0,1)}
+.subtab:hover{color:var(--ink);background:var(--bg-soft);transform:translateY(-1px)}
+.subtab.on{color:var(--accent);background:var(--accent-soft);
+  border-color:color-mix(in srgb,var(--accent) 30%,transparent)}
+.subtab .st-ico{display:inline-flex;opacity:.9}
+.subtab-panel{margin:0}
+.subtab-panel.hide{display:none}
+@media(max-width:860px){.subtab{padding:8px 11px;font-size:11.5px}}
+
 /* 探针 */
 .probe-input{display:flex;gap:10px;flex-wrap:wrap}
 .probe-input .inp{flex:1;min-width:240px;padding:14px 16px;font-size:13.5px;border-radius:14px}
@@ -440,7 +457,7 @@ const S = {
   adminPw:sessionStorage.getItem('mdns.adminpw')||'',
   auth:null, history:null, alerts:null,
   ifaceOptions:[], records:[], logs:[], probe:null,
-  probeName:'_services._dns-sd._udp.local', probeType:'PTR', dirty:false, configMode:'form',
+  probeName:'_services._dns-sd._udp.local', probeType:'PTR', dirty:false, configMode:'form', configSubTab:'basic',
   typeFilter:'ALL', recordSearch:'', logLevel:'ALL', autoScroll:true, es:null,
   health:null, queries:null, browse:null, conflicts:null
 };
@@ -809,6 +826,19 @@ function viewOverview(){
 /* ============================================================
    Config
    ============================================================ */
+/* 配置页子分区：每个 id 对应一个常驻 DOM 的面板，切换时仅切 CSS，不重渲染 */
+const CONFIG_SUBTABS=[
+  {id:'basic',    label:'基础参数',   icon:'sliders'},
+  {id:'mappings', label:'域名与服务', icon:'globe'},
+  {id:'gateway',  label:'HTTP 网关',  icon:'link'},
+  {id:'insights', label:'可观测',     icon:'activity'},
+  {id:'security', label:'安全设置',   icon:'lock'},
+  {id:'history',  label:'版本历史',   icon:'history'},
+  {id:'alerts',   label:'告警通知',   icon:'bell'},
+  {id:'raw',      label:'TOML 源码',  icon:'terminal'}
+];
+/* 网关专属字段，从基础参数里拆到 HTTP 网关面板 */
+const GATEWAY_FIELD_KEYS=['gateway_port','gateway_admin_host','gateway_timeout'];
 function txtToStr(txt){const o=txt||{};return Object.keys(o).map(function(k){return k+'='+o[k];}).join(', ');}
 function strToTxt(s){const o={};String(s||'').split(',').forEach(function(p){const i=p.indexOf('=');if(i>0)o[p.slice(0,i).trim()]=p.slice(i+1).trim();});return o;}
 const SERVER_FIELDS=[
@@ -906,58 +936,87 @@ function configExtras(){
       '<div style="font-size:11px;color:var(--ink-3);margin-top:5px;line-height:1.6">钉钉 / 飞书 / Slack / 企业微信按域名自动适配，其余按通用 JSON 投递。当前 <b>'+fmtNum(al.webhooks||0)+'</b> 个端点 · 累计发送 '+fmtNum(astat.sent||0)+' 条 · 失败 '+fmtNum(astat.failed||0)+' 条'+
       (astat.last_error?' · <span style="color:var(--err)">最近错误 '+esc(astat.last_error)+'</span>':'')+'</div></div>';
 
-  return card('安全设置','修改配置、回滚与改密均需管理员密码',secBody,'s12','d2')+
-         card('配置版本历史','每次保存 / 回滚前自动快照，可一键恢复',histBody,'s12','d3')+
-         card('告警通知','健康翻转与名称冲突推送到群机器人',alertBody,'s12','d4');
+  // 按子 tab 返回独立卡片，由 viewConfig() 分别收进各自的面板
+  return {
+    security: card('安全设置','修改配置、回滚与改密均需管理员密码',secBody,'s12','d1'),
+    history:  card('配置版本历史','每次保存 / 回滚前自动快照，可一键恢复',histBody,'s12','d1'),
+    alerts:   card('告警通知','健康翻转与名称冲突推送到群机器人',alertBody,'s12','d1')
+  };
 }
 function viewConfig(){
   const c=(S.config&&S.config.config)||{server:{},hosts:[],services:[]};
   const srv=c.server||{};
-  const tabs='<div class="controls"><button class="chip'+(S.configMode==='form'?' on':'')+'" data-act="config-mode" data-mode="form">'+icon('sliders',14)+' 可视化编辑</button>'+
-    '<button class="chip'+(S.configMode==='raw'?' on':'')+'" data-act="config-mode" data-mode="raw">'+icon('terminal',14)+' TOML 源码</button></div>';
-  let body;
-  if(S.configMode==='raw'){
-    body=tabs+card('TOML 源码','直接编辑原始配置；保存时会先做完整校验再原子替换',
-      '<textarea class="editor" id="rawEditor" spellcheck="false">'+esc(S.config?S.config.raw:'')+'</textarea>','s12','d1');
-  }else{
-    const insightsGrid='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 26px;margin-top:12px;border-top:1px solid var(--line-soft);padding-top:8px">'+
-      switchRow('health','健康监控（状态灯）',!!srv.health)+
-      switchRow('browse','局域网服务浏览',!!srv.browse)+
-      switchRow('audit','查询审计日志',!!srv.audit)+
-      switchRow('conflict_detect','名称冲突检测',!!srv.conflict_detect)+'</div>'+
-      '<div class="form-grid" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:12px">'+
-        insNum('health_interval','探测周期 (s)',srv.health_interval||30,'0 = 关闭')+
-        insNum('health_timeout','探测超时 (s)',srv.health_timeout||2,'0.1..30')+
-        insNum('audit_limit','审计保留条数',srv.audit_limit||500,'≥10')+
-        insNum('browse_scan_interval','枚举周期 (s)',srv.browse_scan_interval||45,'0 = 仅被动')+
-      '</div>';
-    const form='<div class="form-grid">'+SERVER_FIELDS.map(function(f){return serverField(f,srv[f.k]);}).join('')+'</div>'+
-      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 26px;margin-top:12px;border-top:1px solid var(--line-soft);padding-top:8px">'+
-      switchRow('reverse_ptr','IPv4 反查 PTR',!!srv.reverse_ptr)+switchRow('management','Web 管理界面',!!srv.management)+
-      switchRow('gateway','HTTP 网关（域名直达 80）',!!srv.gateway,'按 Host 头反代到服务端口，并把控制台收编进 80')+'</div>'+
-      '<div style="margin-top:14px;padding:16px 18px;border-radius:16px;background:var(--bg-soft);border:1px solid var(--line-soft)">'+
-      '<div style="font-size:12px;font-weight:750;margin-bottom:4px">'+icon('activity',14)+' 可观测增强</div>'+
-      '<div style="font-size:11px;color:var(--ink-3);margin-bottom:10px">健康探测 / 局域网地图 / 查询审计 / 名称冲突，均热重载即时生效</div>'+insightsGrid+'</div>';
-    const hosts='<table class="tbl"><thead><tr><th>域名</th><th>映射 IP</th><th></th></tr></thead><tbody>'+
-      (c.hosts.length?c.hosts.map(hostRow).join(''):'<tr><td colspan="3" class="empty">暂无域名映射，点击下方按钮添加</td></tr>')+'</tbody></table>'+
-      '<div style="margin-top:14px"><button class="chip" data-act="add-host">'+icon('plus',14)+' 添加域名映射</button></div>';
-    const services='<div style="overflow-x:auto"><table class="tbl" style="min-width:960px"><thead><tr><th>服务类型</th><th>实例名</th><th>绑定域名 (可选)</th><th>映射 IP</th><th>端口</th><th>TXT</th><th style="white-space:nowrap;min-width:84px">网关反代</th><th></th></tr></thead><tbody>'+
-      (c.services.length?c.services.map(serviceRow).join(''):'<tr><td colspan="8" class="empty">暂无服务，点击下方按钮添加</td></tr>')+'</tbody></table></div>'+
-      '<div style="margin-top:14px"><button class="chip" data-act="add-service">'+icon('plus',14)+' 添加服务发布</button></div>';
-    body=tabs+
-      card('服务参数','修改端口 / 网卡 / 管理地址等需重启进程才会生效，其余参数热重载即时生效',form,'s12','d1')+
-      card('域名 → IP 映射','纯 A / AAAA 记录，域名写标准单 label .local 形式；开启网关后可直接 http://域名 访问，或点「打开」经网关访问',hosts,'s5','d2')+
-      card('服务发布 (DNS-SD)','每条自动生成 PTR + SRV + TXT + A；省略 host 时由实例名自动派生 <slug>.local；「网关反代」开则 http://域名 直达端口，关则仅广播发现',services,'s7','d3');
-  }
+  const cur=CONFIG_SUBTABS.some(function(t){return t.id===S.configSubTab;})?S.configSubTab:'basic';
+  const tabs='<div class="subtabs">'+CONFIG_SUBTABS.map(function(t){
+    return '<button type="button" class="subtab'+(t.id===cur?' on':'')+'" data-act="config-subtab" data-subtab="'+t.id+'">'+
+      '<span class="st-ico">'+icon(t.icon,15)+'</span>'+esc(t.label)+'</button>';
+  }).join('')+'</div>';
+
+  // 基础参数：组播 / 管理监听（网关专属字段拆到 HTTP 网关面板）
+  const basicFields=SERVER_FIELDS.filter(function(f){return GATEWAY_FIELD_KEYS.indexOf(f.k)<0;});
+  const gwFields=SERVER_FIELDS.filter(function(f){return GATEWAY_FIELD_KEYS.indexOf(f.k)>=0;});
+  const basicForm='<div class="form-grid">'+basicFields.map(function(f){return serverField(f,srv[f.k]);}).join('')+'</div>'+
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 26px;margin-top:12px;border-top:1px solid var(--line-soft);padding-top:8px">'+
+    switchRow('reverse_ptr','IPv4 反查 PTR',!!srv.reverse_ptr)+switchRow('management','Web 管理界面',!!srv.management)+'</div>';
+  const gwForm='<div class="form-grid">'+gwFields.map(function(f){return serverField(f,srv[f.k]);}).join('')+'</div>'+
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 26px;margin-top:12px;border-top:1px solid var(--line-soft);padding-top:8px">'+
+    switchRow('gateway','启用 HTTP 网关',!!srv.gateway,'按 Host 头反代到服务端口，并把控制台收编进 80')+'</div>'+
+    '<div style="margin-top:14px;padding:15px 18px;border-radius:16px;background:var(--bg-soft);border:1px solid var(--line-soft);font-size:11.5px;color:var(--ink-3);line-height:1.75">'+
+    '开启后监听 0.0.0.0:网关端口（默认 80）：访问 <span class="mono">http://'+esc(srv.gateway_admin_host||'mdns.local')+'/</span> 进入管理台，访问服务域名则按「域名与服务」里的映射 / 端口反代；每个服务还可用「网关反代」开关单独关闭。端口 / 管理台域名变更需重启进程。</div>';
+
+  // 域名映射与服务发布
+  const hosts='<table class="tbl"><thead><tr><th>域名</th><th>映射 IP</th><th></th></tr></thead><tbody>'+
+    (c.hosts.length?c.hosts.map(hostRow).join(''):'<tr><td colspan="3" class="empty">暂无域名映射，点击下方按钮添加</td></tr>')+'</tbody></table>'+
+    '<div style="margin-top:14px"><button class="chip" data-act="add-host">'+icon('plus',14)+' 添加域名映射</button></div>';
+  const services='<div style="overflow-x:auto"><table class="tbl" style="min-width:960px"><thead><tr><th>服务类型</th><th>实例名</th><th>绑定域名 (可选)</th><th>映射 IP</th><th>端口</th><th>TXT</th><th style="white-space:nowrap;min-width:84px">网关反代</th><th></th></tr></thead><tbody>'+
+    (c.services.length?c.services.map(serviceRow).join(''):'<tr><td colspan="8" class="empty">暂无服务，点击下方按钮添加</td></tr>')+'</tbody></table></div>'+
+    '<div style="margin-top:14px"><button class="chip" data-act="add-service">'+icon('plus',14)+' 添加服务发布</button></div>';
+
+  // 可观测增强
+  const insightsGrid='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 26px;margin-top:12px;border-top:1px solid var(--line-soft);padding-top:8px">'+
+    switchRow('health','健康监控（状态灯）',!!srv.health)+
+    switchRow('browse','局域网服务浏览',!!srv.browse)+
+    switchRow('audit','查询审计日志',!!srv.audit)+
+    switchRow('conflict_detect','名称冲突检测',!!srv.conflict_detect)+'</div>'+
+    '<div class="form-grid" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-top:12px">'+
+      insNum('health_interval','探测周期 (s)',srv.health_interval||30,'0 = 关闭')+
+      insNum('health_timeout','探测超时 (s)',srv.health_timeout||2,'0.1..30')+
+      insNum('audit_limit','审计保留条数',srv.audit_limit||500,'≥10')+
+      insNum('browse_scan_interval','枚举周期 (s)',srv.browse_scan_interval||45,'0 = 仅被动')+
+    '</div>';
+
+  const ex=configExtras();
+  const panels={
+    basic: card('基础参数','修改端口 / 网卡 / 管理地址等需重启进程才会生效，其余参数热重载即时生效',basicForm,'s12','d1'),
+    mappings: card('域名 → IP 映射','纯 A / AAAA 记录，域名写标准单 label .local 形式；开启网关后可直接 http://域名 访问，或点「打开」经网关访问',hosts,'s12','d1')+
+              card('服务发布 (DNS-SD)','每条自动生成 PTR + SRV + TXT + A；省略 host 时由实例名自动派生 <slug>.local；「网关反代」开则 http://域名 直达端口，关则仅广播发现',services,'s12','d2'),
+    gateway: card('HTTP 网关','按 Host 头把服务域名反代到目标 IP:端口，并把管理台收编进网关端口',gwForm,'s12','d1'),
+    insights: card('可观测增强','健康探测 / 局域网地图 / 查询审计 / 名称冲突，均热重载即时生效',insightsGrid,'s12','d1'),
+    security: ex.security,
+    history: ex.history,
+    alerts: ex.alerts,
+    raw: card('TOML 源码','直接编辑原始配置；保存时会先做完整校验再原子替换',
+      '<textarea class="editor" id="rawEditor" spellcheck="false">'+esc(S.config?S.config.raw:'')+'</textarea>','s12','d1')
+  };
+  // 所有面板常驻 DOM，只按当前子 tab 加 hide：syncFromDom() 仍能全量收集字段
+  const panelHtml=CONFIG_SUBTABS.map(function(t){
+    return '<div class="subtab-panel'+(t.id===cur?'':' hide')+'" data-panel="'+t.id+'">'+panels[t.id]+'</div>';
+  }).join('');
   const bar='<div class="savebar anim d4" style="margin-top:18px"><div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">'+
     '<span class="dirty'+(S.dirty?'':' hide')+'" id="dirtyFlag">● 有未保存的更改</span>'+
     '<span style="font-size:11.5px;color:var(--ink-3)">保存前自动校验；原文件备份为 config.toml.bak</span></div>'+
     '<div style="display:flex;gap:9px"><button class="btn ghost" data-act="reload">'+icon('refresh',15)+' 重新载入</button>'+
     '<button class="btn" data-act="save">保存并热重载<span class="bico">'+icon('arrow',14)+'</span></button></div></div>';
-  return body+configExtras()+bar;
+  return tabs+panelHtml+bar;
 }
 function syncFromDom(){
-  if(S.tab!=='config'||S.configMode!=='form'||!S.config)return;
+  if(S.tab!=='config'||!S.config)return;
+  if(S.configMode==='raw'){
+    // 源码模式下没有表单字段，但要先保住编辑器里未保存的内容
+    const ed=document.getElementById('rawEditor');
+    if(ed)S.config.raw=ed.value;
+    return;
+  }
   const server={};
   document.querySelectorAll('[data-srv]').forEach(function(el){
     const k=el.dataset.srv,kind=el.dataset.kind;
@@ -1192,7 +1251,21 @@ function viewConflicts(){
 function setTab(t){if(S.tab===t)return;syncFromDom();S.tab=t;
   var v=document.getElementById('view');if(v)v.classList.remove('noanim'); // 主动切 tab：恢复入场动画
   render();}
-function setConfigMode(m){syncFromDom();S.configMode=m;S.dirty=false;renderTab();}
+function setConfigSubTab(id){
+  const t=CONFIG_SUBTABS.find(function(x){return x.id===id;});
+  if(!t||S.configSubTab===id)return;
+  syncFromDom();                              // 把当前编辑同步进内存（面板常驻，字段不丢；raw 模式会暂存源码）
+  S.configSubTab=id;
+  S.configMode=(id==='raw')?'raw':'form';     // 复用既有 raw/form 保存逻辑
+  // 只切 CSS，不重渲染视图：不抖、不丢输入焦点、隐藏字段仍在 DOM 中
+  document.querySelectorAll('.subtab-panel').forEach(function(p){
+    p.classList.toggle('hide',p.dataset.panel!==id);
+  });
+  document.querySelectorAll('[data-act="config-subtab"]').forEach(function(b){
+    b.classList.toggle('on',b.dataset.subtab===id);
+  });
+  const v=document.getElementById('view');if(v)v.classList.remove('noanim');
+}
 function forgetPw(){S.adminPw='';try{sessionStorage.removeItem('mdns.adminpw');}catch(e){}}
 function rememberPw(pw){S.adminPw=pw;try{sessionStorage.setItem('mdns.adminpw',pw);}catch(e){}}
 function passwordModal(title,needConfirm){
@@ -1258,7 +1331,7 @@ async function changePassword(){
     await api('/api/auth/password',{method:'POST',body:JSON.stringify({new_password:pw})});
     rememberPw(pw);
     S.auth=await api('/api/auth');
-    toast('管理员密码已修改','ok');renderTab();
+    toast('管理员密码已修改','ok');syncFromDom();renderTab();
   }catch(e){toast('修改失败：'+e.message,'err');}
 }
 async function doRollback(id){
@@ -1280,7 +1353,7 @@ async function refreshExtras(){
       api('/api/alerts').catch(function(){return null;})]);
     if(a)S.auth=a;if(h)S.history=h;if(al)S.alerts=al;
     const v=document.getElementById('view');if(v)v.classList.add('noanim');
-    renderTab();
+    syncFromDom();renderTab();
   }catch(e){}
 }
 async function saveConfig(){
@@ -1341,7 +1414,7 @@ document.addEventListener('click',function(e){
   else if(a==='endpoint')setEndpoint();
   else if(a==='refresh'){(async function(){try{if(!S.demo){await refreshAll();toast('数据已刷新','ok');}else toast('演示模式：数据为本地模拟','info');render();}catch(x){toast('刷新失败：'+x.message,'err');}})();}
   else if(a==='token')askToken();
-  else if(a==='config-mode')setConfigMode(el.dataset.mode);
+  else if(a==='config-subtab')setConfigSubTab(el.dataset.subtab);
   else if(a==='toggle'){el.classList.toggle('on');markDirty();}
   else if(a==='add-host')addRow('host');
   else if(a==='add-service')addRow('service');
