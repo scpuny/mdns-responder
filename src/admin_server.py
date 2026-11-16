@@ -52,6 +52,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 from mdns_responder import _slug
+from asset_events import (
+    ws_accept_key, ws_text_frame, ws_pong_frame, ws_close,
+    read_ws_frame, encode_event,
+)
 
 LOG = logging.getLogger("mdns.admin")
 
@@ -295,6 +299,26 @@ def dump_toml(config: dict) -> str:
         else:
             lines.append(f"{key} = {_toml_str(value)}")
 
+    # LanAsset 是独立顶层表，必须在结构化保存后原样保留，否则模块会被悄悄关闭。
+    asset = config.get("asset")
+    if isinstance(asset, dict) and asset:
+        lines += ["", "[asset]",
+                  "enabled = " + ("true" if asset.get("enabled") else "false")]
+        for key in ("interval_ms", "timeout_ms", "max_concurrent",
+                    "port_timeout_ms", "retention_days"):
+            if key in asset and asset[key] is not None:
+                lines.append(f"{key} = {int(asset[key])}")
+        for key in ("mode", "port_template", "oui_extra_path"):
+            if key in asset and asset[key] is not None:
+                lines.append(f"{key} = {_toml_str(asset[key])}")
+        if "port_probe" in asset:
+            lines.append("port_probe = " + ("true" if asset.get("port_probe") else "false"))
+        excluded = [str(v) for v in (asset.get("exclude_ips") or []) if str(v).strip()]
+        lines.append("exclude_ips = " + json.dumps(excluded, ensure_ascii=False))
+        custom_ports = [int(v) for v in (asset.get("custom_ports") or [])
+                        if str(v).strip().isdigit()]
+        lines.append("custom_ports = " + json.dumps(custom_ports, ensure_ascii=False))
+
     for host in config.get("hosts", []) or []:
         lines += ["", "[[hosts]]",
                   f"name = {_toml_str(host.get('name', ''))}",
@@ -326,6 +350,18 @@ def merge_server(raw_text: str, submitted: dict) -> dict:
         existing = {}
     merged = dict(existing)
     merged.update(submitted or {})
+    return merged
+
+
+def merge_asset(raw_text: str, submitted: dict | None) -> dict:
+    """保留原 [asset] 段；表单未提交该段时原样写回，避免模块被意外关闭。"""
+    try:
+        existing = tomllib.loads(raw_text).get("asset", {}) or {}
+    except (tomllib.TOMLDecodeError, AttributeError):
+        existing = {}
+    merged = dict(existing)
+    if isinstance(submitted, dict):
+        merged.update(submitted)
     return merged
 
 
@@ -786,6 +822,53 @@ class AdminHandler(BaseHTTPRequestHandler):
 
         responder = self.server.responder
         try:
+            # WebSocket：设备事件统一流（mDNS 被动 + LanAsset 主动）
+            if path == "/api/v1/devices/watch":
+                try:
+                    return self._device_watch()
+                except RuntimeError as exc:
+                    return self._json({"error": str(exc), "code": "asset_disabled"}, 409)
+            if path in ("/api/v1/assets", "/api/v1/scan/status"):
+                try:
+                    if path.endswith("/scan/status"):
+                        return self._json(responder.scan_status())
+                    query = parse_qs(urlparse(self.path).query)
+                    raw_online = query.get("online", [None])[0]
+                    online = (None if raw_online is None
+                              else raw_online.lower() in ("1", "true", "yes", "on"))
+                    return self._json(responder.assets_json(
+                        online=online,
+                        source=query.get("source", [None])[0],
+                        cidr=query.get("cidr", [None])[0],
+                        tag=query.get("tag", [None])[0]))
+                except RuntimeError as exc:
+                    return self._json({"error": str(exc), "code": "asset_disabled"}, 409)
+            # 快照 / 事件 / LanLink 联动配置
+            if path.startswith("/api/v1/"):
+                try:
+                    query = parse_qs(urlparse(self.path).query)
+                    if path == "/api/v1/asset/snapshots":
+                        return self._json(responder.snapshot_list())
+                    if path.startswith("/api/v1/asset/snapshots/"):
+                        rest = path[len("/api/v1/asset/snapshots/"):]
+                        if rest.endswith("/csv"):
+                            csv_text = responder.snapshot_csv(int(rest[:-4]))
+                            return self._text(csv_text, content_type="text/csv; charset=utf-8")
+                        if rest.endswith("/diff"):
+                            other = query.get("other_id", [None])[0]
+                            if not other:
+                                return self._json({"error": "缺少 other_id 参数"}, 400)
+                            return self._json(responder.snapshot_diff(int(rest[:-5]), int(other)))
+                        return self._json(responder.snapshot_detail(int(rest)))
+                    if path == "/api/v1/asset/events":
+                        limit = int(query.get("limit", ["100"])[0])
+                        return self._json(responder.events_history(limit))
+                    if path == "/api/v1/lanlink/config":
+                        return self._json(responder.lanlink_config())
+                except RuntimeError as exc:
+                    return self._json({"error": str(exc), "code": "asset_disabled"}, 409)
+                except (FileNotFoundError, ValueError) as exc:
+                    return self._json({"error": str(exc)}, 404 if isinstance(exc, FileNotFoundError) else 400)
             if path == "/api/status":
                 return self._json(responder.status())
             if path == "/api/config":
@@ -856,6 +939,52 @@ class AdminHandler(BaseHTTPRequestHandler):
                     return None
                 return self._json(responder.rollback_config(str(payload.get("id", ""))))
 
+            if path in ("/api/v1/scan/start", "/api/v1/scan/stop"):
+                try:
+                    if path.endswith("/stop"):
+                        return self._json(responder.scan_stop())
+                    return self._json(responder.scan_start(payload), 202)
+                except RuntimeError as exc:
+                    return self._json({"error": str(exc), "code": "asset_disabled"}, 409)
+                except ValueError as exc:
+                    return self._json({"error": str(exc)}, 400)
+
+            # -- LanAsset：快照 / 元数据 / 静态注册 / 黑名单（写操作需管理员密码）--
+            if path == "/api/v1/asset/snapshots":
+                if not self._require_admin():
+                    return None
+                try:
+                    return self._json(responder.snapshot_create(payload), 201)
+                except RuntimeError as exc:
+                    return self._json({"error": str(exc), "code": "asset_disabled"}, 409)
+            if path.startswith("/api/v1/assets/") and path.endswith("/meta"):
+                if not self._require_admin():
+                    return None
+                ip = path[len("/api/v1/assets/"):-len("/meta")]
+                try:
+                    return self._json(responder.asset_set_meta(ip, payload))
+                except RuntimeError as exc:
+                    return self._json({"error": str(exc), "code": "asset_disabled"}, 409)
+                except FileNotFoundError as exc:
+                    return self._json({"error": str(exc)}, 404)
+            if path.startswith("/api/v1/assets/") and path.endswith("/blacklist"):
+                if not self._require_admin():
+                    return None
+                ip = path[len("/api/v1/assets/"):-len("/blacklist")]
+                try:
+                    return self._json(responder.asset_blacklist(ip))
+                except RuntimeError as exc:
+                    return self._json({"error": str(exc), "code": "asset_disabled"}, 409)
+            if path.startswith("/api/v1/assets/") and path.endswith("/register"):
+                if not self._require_admin():
+                    return None
+                ip = path[len("/api/v1/assets/"):-len("/register")]
+                try:
+                    return self._json(responder.register_asset_host(ip, payload))
+                except RuntimeError as exc:
+                    return self._json({"error": str(exc), "code": "asset_disabled"}, 409)
+                except FileNotFoundError as exc:
+                    return self._json({"error": str(exc)}, 404)
             if path == "/api/reload":
                 responder.request_reload()
                 return self._json({"ok": True, "message": "已触发配置重载"})
@@ -870,6 +999,84 @@ class AdminHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             LOG.exception("POST %s 失败", path)
             return self._json({"error": str(exc)}, 500)
+
+    def _device_watch(self) -> None:
+        """WS 设备事件流：RFC 6455 握手 + 文本帧推送（标准库实现）。"""
+        upgrade = (self.headers.get("Upgrade", "") or "").lower()
+        connection = (self.headers.get("Connection", "") or "").lower()
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if "websocket" not in upgrade or "upgrade" not in connection or not key:
+            return self._json({"error": "需要 WebSocket 升级请求"}, 400)
+        responder = self.server.responder
+        if responder.asset_events is None:
+            raise RuntimeError("资产扫描模块不可用")
+        accept = ws_accept_key(key)
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self._cors()
+        self.end_headers()
+        sub = responder.asset_events.subscribe()
+        # 关闭 HTTP/1.1 keep-alive 的读缓冲期望；sock 进入原始帧模式
+        self.connection.settimeout(None)
+        try:
+            self.wfile.write(encode_event({
+                "id": 0, "event": "connected", "ts": time.time(),
+                "data": {"subscribers": responder.asset_events.subscriber_count()},
+            }))
+            self.wfile.flush()
+            while self.server.running.is_set():
+                # 用短超时轮询订阅队列，同时读取客户端控制帧（ping/close）
+                try:
+                    item = sub.get(timeout=1.0)
+                    self.wfile.write(encode_event(item))
+                    self.wfile.flush()
+                except queue.Empty:
+                    pass
+                # 非阻塞检查客户端帧；不处理数据帧内容，仅响应 ping / close
+                self.connection.setblocking(False)
+                try:
+                    while True:
+                        frame = read_ws_frame(self.connection)
+                        if frame is None:
+                            break
+                        opcode, payload = frame
+                        if opcode == 0x8:  # close
+                            self.wfile.write(ws_close())
+                            self.wfile.flush()
+                            return
+                        if opcode == 0x9:  # ping
+                            self.wfile.write(ws_pong_frame(payload))
+                            self.wfile.flush()
+                except (BlockingIOError, OSError, ValueError, ConnectionError):
+                    pass
+                finally:
+                    self.connection.setblocking(True)
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            pass
+        finally:
+            responder.asset_events.unsubscribe(sub)
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        if not self._authorized():
+            return self._json({"error": "unauthorized"}, 401)
+        responder = self.server.responder
+        try:
+            if path.startswith("/api/v1/asset/snapshots/"):
+                if not self._require_admin():
+                    return None
+                sid = int(path[len("/api/v1/asset/snapshots/"):])
+                try:
+                    return self._json(responder.snapshot_delete(sid))
+                except RuntimeError as exc:
+                    return self._json({"error": str(exc), "code": "asset_disabled"}, 409)
+                except FileNotFoundError as exc:
+                    return self._json({"error": str(exc)}, 404)
+            return self._json({"error": "not found", "path": path}, 404)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, 400)
 
     def _stream_logs(self) -> None:
         self.send_response(200)

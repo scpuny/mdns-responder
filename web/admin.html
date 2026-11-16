@@ -459,7 +459,9 @@ const S = {
   ifaceOptions:[], records:[], logs:[], probe:null,
   probeName:'_services._dns-sd._udp.local', probeType:'PTR', dirty:false, configMode:'form', configSubTab:'basic',
   typeFilter:'ALL', recordSearch:'', logLevel:'ALL', autoScroll:true, es:null,
-  health:null, queries:null, browse:null, conflicts:null
+  health:null, queries:null, browse:null, conflicts:null,
+  assetDevices:[], assetScan:null, assetFilter:'all', assetBusy:false,
+  assetSnapshots:[], assetDiff:null, assetSnapA:'', assetSnapB:'', assetWs:null, assetWsLive:false
 };
 const DEMO_STATUS = {
   running:true,pid:24817,uptime:12968,group:'224.0.0.251',port:5353,interface:'0.0.0.0',
@@ -616,6 +618,7 @@ async function refreshInsights(){
       api('/api/health'),api('/api/queries?limit=100'),
       api('/api/browse'),api('/api/conflicts')]);
     S.health=health;S.queries=queries;S.browse=browse;S.conflicts=conflicts;
+    if(assetEnabled())refreshAsset();
     if(['health','map','audit','conflicts'].indexOf(S.tab)>=0){
       const v=document.getElementById('view');
       // 后台轮询：抑制入场动画（避免每 4s 抖动重放），保持到下一次主动切 tab 再恢复
@@ -682,10 +685,13 @@ const TABS=[
   {id:'health',label:'健康监控',icon:'heart',eyebrow:'Health / 健康监控',title:'健康监控',sub:'周期 TCP 探测已登记目标 · 红绿状态灯'},
   {id:'map',label:'局域网地图',icon:'globe',eyebrow:'Discovery / 局域网地图',title:'局域网服务地图',sub:'摄取局域网内其它 mDNS / DNS-SD 服务实例'},
   {id:'audit',label:'查询审计',icon:'activity',eyebrow:'Audit / 查询审计',title:'查询审计日志',sub:'谁在查什么 · 命中情况 · 有界环形缓冲'},
-  {id:'conflicts',label:'名称冲突',icon:'alert',eyebrow:'Conflicts / 名称冲突',title:'名称冲突登记',sub:'本地同名异值的外来记录（RFC 6762 防御观测）'}
+  {id:'conflicts',label:'名称冲突',icon:'alert',eyebrow:'Conflicts / 名称冲突',title:'名称冲突登记',sub:'本地同名异值的外来记录（RFC 6762 防御观测）'},
+  {id:'asset',label:'资产',icon:'radar',eyebrow:'LanAsset / 资产探测',title:'内网资产',sub:'主动探测与被动 mDNS 合并的统一设备池 · 默认关闭'}
 ];
+function assetEnabled(){return !!(S.status&&S.status.asset&&S.status.asset.enabled);}
 function renderNav(){
-  document.getElementById('nav').innerHTML=TABS.map(function(t){
+  const tabs=TABS.filter(function(t){return t.id!=='asset'||assetEnabled();});
+  document.getElementById('nav').innerHTML=tabs.map(function(t){
     return '<button class="nav-item'+(S.tab===t.id?' on':'')+'" data-act="tab" data-tab="'+t.id+'">'+icon(t.icon,17)+'<span>'+t.label+'</span></button>';
   }).join('');
 }
@@ -711,7 +717,46 @@ function renderTab(){
   else if(S.tab==='map')v.innerHTML=viewMap();
   else if(S.tab==='audit')v.innerHTML=viewAudit();
   else if(S.tab==='conflicts')v.innerHTML=viewConflicts();
+  else if(S.tab==='asset')v.innerHTML=viewAsset();
   else v.innerHTML=viewProbe();
+}
+/* 后台轮询重渲染保护：
+   1) 焦点位于文本输入控件时不重建 DOM，避免打断输入与输入法组合；
+   2) 确需重建时保存并恢复全部表单值、焦点与光标位置。 */
+function renderTabSoft(){
+  const view=document.getElementById('view');
+  const active=document.activeElement;
+  const typing=!!(view&&active&&view.contains(active)&&(
+    active.tagName==='TEXTAREA'||
+    (active.tagName==='INPUT'&&/^(text|number|search|email|url|password|tel)$/i.test(active.type||'text'))));
+  if(typing)return false;
+  const recs=[];
+  if(view){
+    const nodes=view.querySelectorAll('input,select,textarea');
+    for(let i=0;i<nodes.length;i++){
+      const n=nodes[i];
+      if(!n.id)continue;
+      recs.push({id:n.id,type:n.type,checked:n.checked,value:n.value});
+    }
+  }
+  const focusId=active&&active.id?active.id:null;
+  let sel=null;
+  try{if(focusId&&typeof active.selectionStart==='number')sel=[active.selectionStart,active.selectionEnd];}catch(e){}
+  renderTab();
+  recs.forEach(function(r){
+    const n=document.getElementById(r.id);
+    if(!n)return;
+    if(r.type==='checkbox'||r.type==='radio')n.checked=r.checked;
+    else if(n.value!==r.value)n.value=r.value;
+  });
+  if(focusId){
+    const n=document.getElementById(focusId);
+    if(n){
+      try{n.focus({preventScroll:true});}catch(e){n.focus();}
+      if(sel){try{n.setSelectionRange(sel[0],sel[1]);}catch(e){}}
+    }
+  }
+  return true;
 }
 function card(title,sub,body,cls,delay){
   return '<section class="bezel '+(cls||'')+' anim '+(delay||'d1')+'"><div class="core">'+
@@ -1246,11 +1291,267 @@ function viewConflicts(){
 }
 
 /* ============================================================
+   LanAsset view — 主动资产探测 + 统一设备池 + 快照 + WS
+   ============================================================ */
+function assetSourceChips(sources){
+  return (sources||[]).map(function(s){
+    const c=s==='mdns'?'var(--ok)':s==='arp'?'var(--accent)':s==='icmp'?'var(--info)':'var(--ink-3)';
+    return '<span class="chip" style="color:'+c+'">'+esc(s)+'</span>';
+  }).join(' ')||'<span class="t-muted">—</span>';
+}
+function assetPorts(d){
+  const ports=(d.detected_ports||[]).filter(function(p){return p.open;});
+  return ports.length?ports.map(function(p){return p.port+(p.proto&&p.proto!=='tcp'?'/'+p.proto:'');}).join(', '):'—';
+}
+function viewAsset(){
+  const scan=S.assetScan||{state:'idle',stats:{},events:[]};
+  const stats=scan.stats||{},state=scan.state||'idle';
+  const running=state==='running';
+  const total=Number(stats.total||0),done=Number(stats.scanned||0);
+  const pct=total?Math.min(100,Math.round(done/total*100)):0;
+  const devices=(S.assetDevices||[]).filter(function(d){
+    if(S.assetFilter==='all')return true;
+    if(S.assetFilter==='online')return !!d.online;
+    if(S.assetFilter==='offline')return !d.online;
+    return (d.sources||[]).indexOf(S.assetFilter)>=0;
+  });
+  const rows=devices.map(function(d){
+    const services=(d.services||[]).map(function(s){return esc(s.name||s.type);}).join('、');
+    const tags=(d.tags||[]).map(function(t){return '<span class="chip" style="font-size:10px">'+esc(t)+'</span>';}).join('');
+    return '<div style="display:grid;grid-template-columns:120px 130px 92px 52px 1fr 1fr 130px;gap:9px;align-items:center;'+
+      'padding:8px 10px;border-bottom:1px solid var(--line-soft);font-size:11.5px" data-ip="'+esc(d.ip)+'">'+
+      '<span style="font-family:var(--mono)">'+esc(d.ip)+'</span>'+
+      '<span>'+assetSourceChips(d.sources)+'</span>'+
+      '<span class="t-muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(d.mac||'')+'">'+esc(d.mac||'—')+'</span>'+
+      '<span style="color:'+(d.online?'var(--ok)':'var(--err)')+'">'+(d.online?'在线':'离线')+'</span>'+
+      '<span class="t-muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(d.vendor||'')+'">'+esc(d.vendor||'—')+' '+tags+'</span>'+
+      '<span class="t-muted mono" title="'+esc(services)+'">'+esc(assetPorts(d))+(services?' · '+esc(services):'')+'</span>'+
+      '<span style="display:flex;gap:5px;justify-content:flex-end">'+
+        '<button class="chip" data-act="asset-open" data-ip="'+esc(d.ip)+'">打开</button>'+
+        (d.linked_mdns_record?'<span class="chip" style="color:var(--ok)" title="'+esc(d.linked_mdns_record)+'">已注册</span>':
+          '<button class="chip" data-act="asset-register" data-ip="'+esc(d.ip)+'">注册</button>')+
+      '</span></div>';
+  }).join('');
+  const events=(scan.events||[]).slice(-8).reverse().map(function(e){
+    return '<div style="font-size:11px;color:var(--ink-2);padding:3px 0">'+
+      esc(new Date(e.time*1000).toLocaleTimeString('zh-CN',{hour12:false}))+' · '+esc(e.message)+'</div>';
+  }).join('')||'<div class="t-muted" style="font-size:11px">暂无扫描事件</div>';
+  const cfg=(S.config&&S.config.config&&S.config.config.asset)||{};
+  const filters=[['all','全部'],['online','在线'],['offline','离线'],['mdns','mDNS'],['arp','ARP'],['icmp','ICMP']]
+    .map(function(f){return '<button class="chip'+(S.assetFilter===f[0]?' on':'')+'" data-act="asset-filter" data-filter="'+f[0]+'">'+f[1]+'</button>';}).join(' ');
+  const mode=cfg.mode||'arp+icmp';
+  const controls=
+    '<div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px">'+
+      '<div class="field"><label>CIDR 网段</label><input id="assetCidr" class="inp mono" placeholder="192.168.1.0/24"></div>'+
+      '<div class="field"><label>间隔 ms</label><input id="assetInterval" class="inp" type="number" min="10" max="1000" value="'+(cfg.interval_ms||200)+'"></div>'+
+      '<div class="field"><label>超时 ms</label><input id="assetTimeout" class="inp" type="number" min="50" max="5000" value="'+(cfg.timeout_ms||800)+'"></div>'+
+      '<div class="field"><label>并发数</label><input id="assetConcurrency" class="inp" type="number" min="1" max="256" value="'+(cfg.max_concurrent||16)+'"></div>'+
+    '</div>'+
+    '<div style="display:flex;gap:14px;align-items:center;margin-top:12px;flex-wrap:wrap">'+
+      '<span style="font-size:11px;color:var(--ink-2)">探测模式</span>'+
+      '<select id="assetMode" class="inp" style="width:auto">'+
+        ['arp','icmp','arp+icmp'].map(function(m){return '<option value="'+m+'"'+(mode===m?' selected':'')+'>'+m+'</option>';}).join('')+
+      '</select>'+
+      '<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-2)">'+
+        '<input type="checkbox" id="assetPortProbe" '+(cfg.port_probe?'checked':'')+'> 端口探针（仅指定端口）</label>'+
+      '<select id="assetPortTemplate" class="inp" style="width:auto">'+
+        [['','自定义'],['dev','开发(22/80/443/3000)'],['industrial','工控(502/1883/8080)']]
+          .map(function(t){return '<option value="'+t[0]+'"'+((cfg.port_template||'')===t[0]?' selected':'')+'>'+t[1]+'</option>';}).join('')+
+      '</select>'+
+      '<input id="assetCustomPorts" class="inp mono" style="width:150px" placeholder="自定义端口,如 9000,502" value="'+esc((cfg.custom_ports||[]).join(','))+'">'+
+    '</div>'+
+    '<div style="display:flex;gap:12px;align-items:center;margin-top:12px;flex-wrap:wrap">'+
+      '<button class="btn" data-act="scan-start" '+(running?'disabled':'')+'>'+icon('play',14)+' 开始扫描</button>'+
+      '<button class="btn ghost" data-act="scan-stop" '+(running?'':'disabled')+'>停止扫描</button>'+
+      '<label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--ink-2)">'+
+        '<input type="checkbox" id="assetConfirm"> 确认扫描大网段（/23 及以上）</label>'+
+      '<span style="font-size:11px;color:var(--ink-2)">排除IP：'+(cfg.exclude_ips||[]).join(', ')+'</span>'+
+      '<span class="chip" style="color:'+(S.assetWsLive?'var(--ok)':'var(--ink-3)')+'" id="assetWsBadge">'+
+        (S.assetWsLive?'● WS 实时':'○ WS 未连接')+'</span>'+
+    '</div>'+
+    '<div style="margin-top:12px"><div style="display:flex;justify-content:space-between;font-size:11px;color:var(--ink-2)">'+
+      '<span>'+esc(state)+' · '+done+' / '+total+' '+(stats.eta_seconds?'· 预计剩余 '+stats.eta_seconds+'s':'')+
+        (stats.mode?' · '+esc(stats.mode):'')+'</span><span>'+pct+'%</span></div>'+
+      '<div style="height:6px;border-radius:4px;background:var(--bg-soft);margin-top:5px;overflow:hidden">'+
+        '<div style="height:100%;width:'+pct+'%;background:var(--accent);transition:width .3s"></div></div></div>';
+  const snaps=(S.assetSnapshots||[]);
+  const snapRows=snaps.map(function(s){
+    return '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 4px;border-bottom:1px solid var(--line-soft);font-size:11.5px">'+
+      '<span><b>#'+s.id+'</b> '+esc(s.name)+' <span class="t-muted">· '+new Date(s.created_at*1000).toLocaleString('zh-CN',{hour12:false})+'</span></span>'+
+      '<span style="display:flex;gap:5px">'+
+        '<span class="chip">'+s.device_count+' 台</span>'+
+        '<button class="chip" data-act="snap-csv" data-id="'+s.id+'">CSV</button>'+
+        '<button class="chip" data-act="snap-del" data-id="'+s.id+'">删除</button>'+
+      '</span></div>';
+  }).join('')||'<div class="t-muted" style="font-size:11px;padding:8px 0">暂无快照</div>';
+  const snapOpts=snaps.map(function(s){return '<option value="'+s.id+'">#'+s.id+' '+esc(s.name)+'</option>';}).join('');
+  const diff=S.assetDiff;
+  const diffView=diff?('<div style="margin-top:10px;font-size:11.5px">'+
+      '<div style="color:var(--ok)">新增 '+diff.summary.added+' · '+diff.added.map(function(d){return esc(d.ip);}).join(', ')+'</div>'+
+      '<div style="color:var(--err)">消失 '+diff.summary.removed+' · '+diff.removed.map(function(d){return esc(d.ip);}).join(', ')+'</div>'+
+      '<div style="color:#d97706">变更 '+diff.summary.changed+' · '+diff.changed.map(function(d){return esc(d.ip)+'('+d.changes.join('/')+')';}).join(', ')+'</div>'+
+    '</div>'):'';
+  const snapshotPanel=
+    '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">'+
+      '<input id="snapName" class="inp" style="width:160px" placeholder="快照名称">'+
+      '<input id="snapNote" class="inp" style="width:200px" placeholder="备注（可选）">'+
+      '<button class="btn ghost" data-act="snap-create">保存快照</button>'+
+      '<span style="color:var(--ink-3);font-size:11px">对比：</span>'+
+      '<select id="snapA" class="inp" style="width:auto"><option value="">选择A</option>'+snapOpts+'</select>'+
+      '<select id="snapB" class="inp" style="width:auto"><option value="">选择B</option>'+snapOpts+'</select>'+
+      '<button class="btn ghost" data-act="snap-diff">生成差异</button>'+
+    '</div>'+snapRows+diffView;
+  return '<div class="grid12">'+
+    metric('统一设备','<span class="tabnum">'+(S.assetDevices||[]).length+'</span>',
+      'mDNS 被动 + 主动探测合并',7,'d1')+
+    metric('扫描状态','<span class="tabnum" style="font-size:16px">'+esc(state)+'</span>',
+      '在线 '+(stats.online||0)+' · 离线 '+(stats.offline||0),3,'d2')+
+    metric('OUI 库','<span class="tabnum" style="font-size:16px">'+(cfg.oui_size||'—')+'</span>',
+      '离线精简前缀，Unknown 兜底',2,'d2')+
+    card('扫描控制','人工触发 · 限速 · 网段隔离 · 关闭模块自动取消',controls,'s12','d3')+
+    card('统一设备列表','来源着色：mDNS 绿 · ARP 靛 · ICMP 蓝 · 右键更多操作',
+      '<div style="display:flex;gap:8px;margin-bottom:10px">'+filters+'</div>'+
+      '<div style="border:1px solid var(--line);border-radius:8px;overflow:hidden">'+
+      '<div style="display:grid;grid-template-columns:120px 130px 92px 52px 1fr 1fr 130px;gap:9px;padding:8px 10px;'+
+      'background:var(--bg-soft);font-size:11px;color:var(--ink-2)">'+
+      '<span>IP</span><span>来源</span><span>MAC</span><span>状态</span><span>厂商 / 标签</span><span>端口 / 服务</span><span style="text-align:right">操作</span></div>'+
+      (rows||'<div class="empty" style="padding:28px">暂无资产 · 选择网段后开始扫描</div>')+'</div>','s12','d4')+
+    card('资产快照 & 对比','巡检留存 · 新增/消失/变更 · CSV 台账',snapshotPanel,'s12','d5')+
+    card('扫描日志','探测失败 / 权限降级 / 扫描事件提示',events,'s12','d6')+
+  '</div>'+
+  '<div id="assetCtx" class="bezel" style="position:absolute;z-index:40;padding:6px;min-width:150px;display:none"></div>';
+}
+
+async function refreshAsset(){
+  if(S.demo||!assetEnabled())return;
+  try{
+    const data=await api('/api/v1/assets');
+    S.assetDevices=data.items||[];
+    S.assetScan=data.scan||S.assetScan;
+    if(S.tab==='asset'){const v=document.getElementById('view');if(v)v.classList.add('noanim');renderTabSoft();}
+  }catch(e){/* 静默，保留上次数据 */}
+}
+async function refreshSnapshots(){
+  if(S.demo||!assetEnabled())return;
+  try{const d=await api('/api/v1/asset/snapshots');S.assetSnapshots=d.items||[];
+    if(S.tab==='asset')renderTabSoft();}catch(e){}
+}
+async function startScan(){
+  const el=document.getElementById('assetCidr');
+  const payload={cidr:((el&&el.value)||'').trim(),
+    confirm_large:!!(document.getElementById('assetConfirm')||{}).checked};
+  [['assetInterval','interval_ms'],['assetTimeout','timeout_ms'],['assetConcurrency','max_concurrent']]
+    .forEach(function(pair){const n=document.getElementById(pair[0]);if(n&&n.value)payload[pair[1]]=Number(n.value);});
+  const modeEl=document.getElementById('assetMode');if(modeEl)payload.mode=modeEl.value;
+  const pp=document.getElementById('assetPortProbe');if(pp)payload.port_probe=pp.checked;
+  const tpl=document.getElementById('assetPortTemplate');if(tpl&&tpl.value)payload.port_template=tpl.value;
+  const cp=document.getElementById('assetCustomPorts');
+  if(cp&&cp.value.trim())payload.custom_ports=cp.value.split(/[,，\s]+/).filter(Boolean).map(Number).filter(function(n){return n>0&&n<65536;});
+  if(!payload.cidr){toast('请填写扫描网段 CIDR','err');return;}
+  try{await api('/api/v1/scan/start',{method:'POST',body:JSON.stringify(payload)});
+    toast('扫描已启动 · 可能触发安全软件告警','ok');refreshAsset();}
+  catch(x){toast('启动失败：'+x.message,'err');}
+}
+async function stopScan(){
+  try{await api('/api/v1/scan/stop',{method:'POST',body:'{}'});toast('已请求停止扫描','ok');refreshAsset();}
+  catch(x){toast('停止失败：'+x.message,'err');}
+}
+function clipboard(text,label){
+  if(navigator.clipboard&&navigator.clipboard.writeText)
+    navigator.clipboard.writeText(text).then(function(){toast('已复制'+(label?' '+label:''),'ok');});
+}
+async function assetAction(action,ip,extra){
+  if(action==='open'){window.open('http://'+ip,'_blank','noopener');}
+  else if(action==='copy'){clipboard(ip,ip);}
+  else if(action==='copy-mac'){
+    const d=(S.assetDevices||[]).find(function(x){return x.ip===ip;});
+    if(d&&d.mac)clipboard(d.mac,d.mac);else toast('该设备无 MAC（跨网段 ICMP 无法获取）','info');
+  }
+  else if(action==='link'){clipboard(ip,'设备 IP，可粘贴到 LanLink');toast('LanLink 可订阅 /api/v1/devices/watch 自动获取设备','info');}
+  else if(action==='register'){
+    try{const r=await api('/api/v1/assets/'+encodeURIComponent(ip)+'/register',{method:'POST',body:'{}'});
+      toast('已注册静态记录 '+r.name,'ok');refreshAsset();}
+    catch(x){toast('注册失败：'+x.message,'err');}
+  }
+  else if(action==='blacklist'){
+    try{await api('/api/v1/assets/'+encodeURIComponent(ip)+'/blacklist',{method:'POST',body:'{}'});
+      toast('已将 '+ip+' 加入黑名单','ok');refreshAll();}
+    catch(x){toast('加入黑名单失败：'+x.message,'err');}
+  }
+  else if(action==='tag'||action==='remark'){
+    const d=(S.assetDevices||[]).find(function(x){return x.ip===ip;});
+    if(!d)return;
+    if(action==='tag'){
+      const v=window.prompt('标签（逗号分隔），当前：'+(d.tags||[]).join(','),(d.tags||[]).join(','));
+      if(v===null)return;
+      try{await api('/api/v1/assets/'+encodeURIComponent(ip)+'/meta',{method:'POST',body:JSON.stringify({tags:v.split(/[,，]/).map(function(s){return s.trim();}).filter(Boolean)})});refreshAsset();}
+      catch(x){toast('保存失败：'+x.message,'err');}
+    }else{
+      const v=window.prompt('备注',d.remark||'');if(v===null)return;
+      try{await api('/api/v1/assets/'+encodeURIComponent(ip)+'/meta',{method:'POST',body:JSON.stringify({remark:v})});refreshAsset();}
+      catch(x){toast('保存失败：'+x.message,'err');}
+    }
+  }
+  const m=document.getElementById('assetCtx');if(m)m.style.display='none';
+}
+async function snapCreate(){
+  const n=(document.getElementById('snapName')||{}).value||'';
+  const note=(document.getElementById('snapNote')||{}).value||'';
+  try{await api('/api/v1/asset/snapshots',{method:'POST',body:JSON.stringify({name:n,note:note})});
+    toast('快照已保存','ok');refreshSnapshots();}
+  catch(x){toast('保存失败：'+x.message,'err');}
+}
+async function snapDiff(){
+  const a=(document.getElementById('snapA')||{}).value,b=(document.getElementById('snapB')||{}).value;
+  if(!a||!b||a===b){toast('请选择两个不同的快照','err');return;}
+  try{S.assetDiff=await api('/api/v1/asset/snapshots/'+a+'/diff?other_id='+b);renderTabSoft();}
+  catch(x){toast('对比失败：'+x.message,'err');}
+}
+async function snapDelete(id){
+  try{await api('/api/v1/asset/snapshots/'+id,{method:'DELETE'});toast('快照已删除','ok');
+    if(S.assetDiff)S.assetDiff=null;refreshSnapshots();}
+  catch(x){toast('删除失败：'+x.message,'err');}
+}
+async function snapCsv(id){
+  try{
+    const r=await fetch('/api/v1/asset/snapshots/'+id+'/csv'+apiTokenSuffix());
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const text=await r.text();
+    const blob=new Blob(['\ufeff'+text],{type:'text/csv;charset=utf-8'}),a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);a.download='asset-snapshot-'+id+'.csv';a.click();URL.revokeObjectURL(a.href);
+    toast('CSV 已导出','ok');
+  }catch(x){toast('导出失败：'+x.message,'err');}
+}
+function apiTokenSuffix(){return S.token?('?token='+encodeURIComponent(S.token)):'';}
+function connectAssetWs(){
+  if(S.demo||!assetEnabled())return;
+  if(S.assetWs&&(S.assetWs.readyState===0||S.assetWs.readyState===1))return;
+  try{
+    const proto=location.protocol==='https:'?'wss:':'ws:';
+    const ws=new WebSocket(proto+'//'+location.host+'/api/v1/devices/watch'+(S.token?('?token='+encodeURIComponent(S.token)):''));
+    S.assetWs=ws;
+    ws.onopen=function(){S.assetWsLive=true;updateWsBadge();};
+    ws.onclose=function(){S.assetWsLive=false;updateWsBadge();};
+    ws.onmessage=function(e){
+      try{const ev=JSON.parse(e.data);
+        if(ev.event&&ev.event.indexOf('scan.')===0||ev.event==='scan.start'||ev.event==='scan.done')
+          refreshAsset();
+        else if(ev.event&&ev.event.indexOf('device.')===0&&S.tab==='asset')refreshAsset();
+      }catch(err){}
+    };
+  }catch(e){}
+}
+function updateWsBadge(){
+  const b=document.getElementById('assetWsBadge');
+  if(b){b.textContent=S.assetWsLive?'● WS 实时':'○ WS 未连接';b.style.color=S.assetWsLive?'var(--ok)':'var(--ink-3)';}
+}
+
+/* ============================================================
    Actions
    ============================================================ */
 function setTab(t){if(S.tab===t)return;syncFromDom();S.tab=t;
   var v=document.getElementById('view');if(v)v.classList.remove('noanim'); // 主动切 tab：恢复入场动画
-  render();}
+  render();if(t==='asset'){refreshAsset();refreshSnapshots();connectAssetWs();}}
 function setConfigSubTab(id){
   const t=CONFIG_SUBTABS.find(function(x){return x.id===id;});
   if(!t||S.configSubTab===id)return;
@@ -1407,9 +1708,20 @@ function downloadLogs(){
   toast('日志已导出','ok');
 }
 document.addEventListener('click',function(e){
+  const ctx=document.getElementById('assetCtx');
+  if(ctx&&!e.target.closest('#assetCtx'))ctx.style.display='none';
   const el=e.target.closest('[data-act]');if(!el)return;
   const a=el.dataset.act;
   if(a==='tab')setTab(el.dataset.tab);
+  else if(a==='scan-start')startScan();
+  else if(a==='scan-stop')stopScan();
+  else if(a==='asset-filter'){S.assetFilter=el.dataset.filter;renderTabSoft();}
+  else if(a==='asset-copy'||a==='asset-open'||a==='asset-register')assetAction(a==='asset-copy'?'copy':a==='asset-open'?'open':'register',el.dataset.ip);
+  else if(a==='snap-create')snapCreate();
+  else if(a==='snap-diff')snapDiff();
+  else if(a==='snap-del')snapDelete(Number(el.dataset.id));
+  else if(a==='snap-csv')snapCsv(Number(el.dataset.id));
+  else if(a.indexOf('asset-')===0)assetAction(a.slice(6),el.dataset.ip);
   else if(a==='theme')toggleTheme();
   else if(a==='endpoint')setEndpoint();
   else if(a==='refresh'){(async function(){try{if(!S.demo){await refreshAll();toast('数据已刷新','ok');}else toast('演示模式：数据为本地模拟','info');render();}catch(x){toast('刷新失败：'+x.message,'err');}})();}
@@ -1436,6 +1748,24 @@ document.addEventListener('click',function(e){
     if(n)n.value=el.dataset.name;if(t)t.value=el.dataset.type;
     runProbe(el.dataset.name,el.dataset.type);
   }
+});
+document.addEventListener('contextmenu',function(e){
+  if(S.tab!=='asset')return;
+  const row=e.target.closest('[data-ip]');if(!row)return;
+  e.preventDefault();
+  const m=document.getElementById('assetCtx');if(!m)return;
+  const ip=row.dataset.ip;
+  m.innerHTML='<button class="chip" data-act="asset-open" data-ip="'+esc(ip)+'">打开 Web</button>'+
+    '<button class="chip" data-act="asset-copy" data-ip="'+esc(ip)+'">复制 IP</button>'+
+    '<button class="chip" data-act="asset-copy-mac" data-ip="'+esc(ip)+'">复制 MAC</button>'+
+    '<button class="chip" data-act="asset-register" data-ip="'+esc(ip)+'">注册静态 mDNS</button>'+
+    '<button class="chip" data-act="asset-tag" data-ip="'+esc(ip)+'">添加标签</button>'+
+    '<button class="chip" data-act="asset-remark" data-ip="'+esc(ip)+'">备注</button>'+
+    '<button class="chip" data-act="asset-link" data-ip="'+esc(ip)+'">LanLink 传输</button>'+
+    '<button class="chip" data-act="asset-blacklist" data-ip="'+esc(ip)+'">加入黑名单</button>';
+  m.style.left=Math.min(e.clientX,window.innerWidth-180)+'px';
+  m.style.top=Math.min(e.clientY,window.innerHeight-200)+'px';
+  m.style.display='block';
 });
 document.addEventListener('input',function(e){
   const t=e.target;

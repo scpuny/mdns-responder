@@ -154,6 +154,7 @@ curl -fsSL https://raw.githubusercontent.com/scpuny/mdns-responder/main/install.
 
 ```toml
 [server]          # 组播 / 管理台 / 日志 / 可观测 / 告警 / 历史参数
+[asset]           # LanAsset M0 原型：主动探测，默认关闭
 [[hosts]]         # 域名 → IP 纯映射
 [[services]]      # DNS-SD 服务（自动 PTR+SRV+TXT+A）
 ```
@@ -183,6 +184,27 @@ curl -fsSL https://raw.githubusercontent.com/scpuny/mdns-responder/main/install.
 | `history_limit` | `30` | 配置版本快照有界保留份数 |
 
 > 除 `log_*` 段（改了需重启）外，所有键都支持热重载。
+
+### `[asset]` （LanAsset 主动资产探测，默认关闭）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 总开关；关闭时资产 Tab 隐藏、所有扫描 / 资产 API 返回 409、正在进行的扫描自动取消 |
+| `interval_ms` | `200` | 探测间隔（10..1000ms），限速防扫描风暴 |
+| `timeout_ms` | `800` | 单次探测超时（50..5000ms） |
+| `max_concurrent` | `16` | 最大并发探测数（1..256） |
+| `exclude_ips` | `[]` | 排除地址（网关 / 路由 / 固定服务器），不参与扫描 |
+| `mode` | `"arp+icmp"` | 探测模式：`arp`（二层，需 CAP_NET_RAW）/ `icmp`（跨网段）/ `arp+icmp`（默认推荐）；ARP 不可用时自动降级 ICMP |
+| `port_probe` | `false` | 端口探针开关；仅探测下方模板/自定义端口，绝不全端口扫描 |
+| `port_template` | `""` | `dev`(22,80,443,3000) / `industrial`(502,1883,8080) / `custom` |
+| `custom_ports` | `[]` | 自定义端口列表，如 `[502, 8080]` |
+| `port_timeout_ms` | `300` | 单端口连接超时（50..5000ms） |
+| `oui_extra_path` | `""` | 可选外部 OUI JSON（6 位前缀 → 厂商），留空用内置精简库 |
+| `retention_days` | `7` | 离线资产保留天数；`0` = 永久保留 |
+
+> 红线：绝不后台自动扫描，所有扫描必须由用户点击触发；禁止 `0.0.0.0/0`，超过 `/24` 的网段需显式确认；
+> ARP 需二层权限（Linux `CAP_NET_RAW` / Windows 管理员），无权限时自动降级 ICMP 并在日志提示。
+> OUI 离线匹配，内置精简前缀库（无匹配显示 `Unknown`），不联网查询。
 
 ### `[[hosts]]` 示例
 
@@ -408,6 +430,22 @@ curl -s http://127.0.0.1:8765/api/metrics
 | GET | `/api/auth` | 管理员密码状态（是否启用 / 算法 / 更新时间） |
 | GET | `/api/config/history` | 配置版本列表 |
 | GET | `/api/alerts` | 告警编排器状态与统计 |
+| GET | `/api/v1/assets` | 合并后的统一设备池（支持 `online` / `source` / `cidr` / `tag` 过滤，需启用 `[asset]`） |
+| GET | `/api/v1/scan/status` | 扫描状态、进度与最近事件 |
+| GET | `/api/v1/asset/snapshots` | 快照列表 |
+| GET | `/api/v1/asset/snapshots/{id}` | 快照详情 |
+| GET | `/api/v1/asset/snapshots/{id}/csv` | 快照导出 CSV（`text/csv`） |
+| GET | `/api/v1/asset/snapshots/{id}/diff?other_id=` | 两快照对比（新增 / 消失 / 信息变更） |
+| GET | `/api/v1/asset/events?limit=` | 设备事件历史与订阅数 |
+| GET | `/api/v1/lanlink/config` | LanLink 联动配置（WS 路径 / 默认网段 / 事件类型） |
+| POST | `/api/v1/scan/start` | 手动启动扫描（body：`cidr` / `mode` / `port_probe` / `port_template` / `custom_ports` / `interval_ms` / `timeout_ms` / `max_concurrent` / `confirm_large`） |
+| POST | `/api/v1/scan/stop` | 取消正在进行的扫描 |
+| POST | `/api/v1/asset/snapshots` | 新建快照（**需密码**，body `{name,note}`） |
+| POST | `/api/v1/assets/{ip}/meta` | 更新标签 / 备注 / 静态记录关联（**需密码**） |
+| POST | `/api/v1/assets/{ip}/register` | 一键注册静态 mDNS 记录并热重载（**需密码**） |
+| POST | `/api/v1/assets/{ip}/blacklist` | 加入扫描黑名单（**需密码**） |
+| DELETE | `/api/v1/asset/snapshots/{id}` | 删除快照（**需密码**） |
+| WS | `/api/v1/devices/watch` | 设备事件统一流：`device.add/update/offline` + `scan.start/done/stop`（LanLink 单一订阅源） |
 | POST | `/api/auth/password` | 首次设置 / 修改管理员密码（body `new_password`） |
 | POST | `/api/auth/verify` | 校验管理员密码 |
 | POST | `/api/config` | 保存配置（**需密码**，body `{raw}` 或 `{config}`） |
@@ -508,7 +546,9 @@ docker run -d --name mdns --network host \
 管理 API（REST / SSE / 401 鉴权 / 结构化保存→备份→热重载 / 非法配置 400 且不破坏原配置）、
 可观测四路由、Prometheus 文本指标、管理员密码全生命周期（初始化 / 校验 / 改密 / 写操作 409/403）、
 配置版本快照与一键回滚、告警编排纯逻辑、网关友好页四分支、日志轮转上界。
-当前全量 **146 passed / 0 failed**（其中离线 97 条）。
+LanAsset：默认关闭 / 限速 / 取消 / 设备池合并、OUI 离线查询、端口模板、SQLite 快照对比与 CSV、
+WS 帧协议（RFC 6455 向量）、扩展 asset 配置 TOML 往返。
+当前全量 **192 passed / 0 failed**。
 
 单独跑：
 
@@ -565,7 +605,11 @@ mdns-responder/
     mdns_alerts.py      告警 Webhook 编排（平台识别 / 冷却 / 重试）
     admin_server.py     Web 管理 API（ThreadingHTTPServer）+ 友好页 + 网关
     mdns_probe.py       查询探针（调试 / 验证）
-  web/admin.html        管理控制台前端（单文件，零外部依赖）
+    lan_asset.py        LanAsset 探测核心：ICMP/ARP/端口探针 + 统一设备池（默认关闭）
+    asset_oui.py        离线精简 OUI 厂商库（可叠加外部 JSON）
+    asset_events.py     设备事件总线 + WebSocket(RFC 6455) 帧工具
+    asset_db.py         SQLite 快照 / 对比 / CSV / 配置与设备元数据持久化
+  web/admin.html        管理控制台前端（单文件，零外部依赖，含「资产」Tab）
   tests/selftest.py     离线 + 组播端到端 + 管理 API + 新功能自测
   deploy/
     mdns-responder.service   systemd 单元

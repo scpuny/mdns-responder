@@ -47,6 +47,23 @@ from typing import Iterable
 
 LOG = logging.getLogger("mdns")
 
+# LanAsset 是可选模块：缺失时主服务完全退化为纯 mDNS responder。
+try:
+    from lan_asset import AssetStore, ScanManager, config_from_dict
+    from asset_events import DeviceEventBus
+    from asset_db import AssetDatabase
+    from asset_oui import OUILookup, DEFAULT_LOOKUP
+    LAN_ASSET_AVAILABLE = True
+except ImportError:                         # pragma: no cover - 裁剪构建
+    AssetStore = None                       # type: ignore[assignment]
+    ScanManager = None                      # type: ignore[assignment]
+    config_from_dict = None                 # type: ignore[assignment]
+    DeviceEventBus = None                   # type: ignore[assignment]
+    AssetDatabase = None                    # type: ignore[assignment]
+    OUILookup = None                        # type: ignore[assignment]
+    DEFAULT_LOOKUP = None                   # type: ignore[assignment]
+    LAN_ASSET_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # DNS / mDNS 常量
 # ---------------------------------------------------------------------------
@@ -428,6 +445,7 @@ class Config:
     services: list[ServiceEntry]
     path: str
     mtime_ns: int
+    asset: object = None                    # lan_asset.AssetConfig，默认关闭
 
 
 def _as_str(value: object, field_name: str) -> str:
@@ -603,7 +621,15 @@ def load_config(path: str) -> Config:
     if not hosts and not services:
         raise ConfigError("配置中没有任何 hosts 或 services，服务不会发布任何记录")
 
-    return Config(server, hosts, services, os.path.abspath(path), os.stat(path).st_mtime_ns)
+    asset = None
+    if LAN_ASSET_AVAILABLE and isinstance(raw.get("asset", {}), dict):
+        try:
+            asset = config_from_dict(raw.get("asset", {}))
+        except ValueError as exc:
+            raise ConfigError(f"asset 配置错误: {exc}") from exc
+
+    return Config(server, hosts, services, os.path.abspath(path),
+                  os.stat(path).st_mtime_ns, asset)
 
 
 def _slug(instance: str) -> str:
@@ -1023,6 +1049,24 @@ class Responder:
             timeout=srv.alert_timeout, on_health=srv.alert_on_health,
             on_conflict=srv.alert_on_conflict, enabled=srv.alert)
         self.config_saves = 0
+        # LanAsset：默认关闭的独立探测组件，生命周期由 responder 托管
+        self.asset_events = DeviceEventBus() if LAN_ASSET_AVAILABLE else None
+        self.asset_db = (AssetDatabase() if LAN_ASSET_AVAILABLE and self.cfg.asset is not None
+                         else None)
+        self.asset_store = (AssetStore(event_bus=self.asset_events)
+                            if LAN_ASSET_AVAILABLE else None)
+        self.asset_scan = (ScanManager(self.asset_store, self.cfg.asset,
+                                       event_bus=self.asset_events)
+                           if LAN_ASSET_AVAILABLE and self.cfg.asset is not None
+                           else None)
+        # 恢复持久化的设备用户字段（标签 / 备注 / 静态 mDNS 关联）
+        if self.asset_db is not None and self.asset_store is not None:
+            for ip, meta in self.asset_db.all_device_meta().items():
+                self.asset_store.restore_meta(
+                    ip, tags=meta.get("tags"), remark=meta.get("remark"),
+                    linked_mdns_record=meta.get("linked_mdns_record"))
+        LOG.info("资产扫描模块：%s",
+                 "已启用" if self.asset_scan and self.cfg.asset.enabled else "未启用（默认）")
         LOG.info("管理员密码：%s（auth.toml %s）",
                  "已启用" if self.auth.enabled else "尚未设置",
                  self.auth.path)
@@ -1141,6 +1185,9 @@ class Responder:
                 "sent": self.alerts.state()["stats"]["sent"],
                 "failed": self.alerts.state()["stats"]["failed"],
             },
+            "asset": self.asset_scan.status() if self.asset_scan else {
+                "enabled": False, "state": "unavailable", "stats": {}, "events": [],
+            },
             "stats": dict(self.stats),
             "config_saves": self.config_saves,
             "config_path": self.config_path,
@@ -1182,6 +1229,179 @@ class Responder:
         data = self.conflicts.json()
         data["enabled"] = True
         return data
+
+    # ------------------------------------------------------------------
+    # LanAsset API（由 admin_server.py 路由到这些方法）
+    # ------------------------------------------------------------------
+    def _asset_guard(self):
+        if self.asset_scan is None or self.asset_store is None:
+            raise RuntimeError("此构建未包含资产扫描模块")
+        if not self.cfg.asset or not self.cfg.asset.enabled:
+            raise RuntimeError("资产扫描模块未启用，请先在配置中开启 [asset].enabled")
+        return self.asset_scan, self.asset_store
+
+    def assets_json(self, *, online=None, source: str | None = None,
+                    cidr: str | None = None, tag: str | None = None) -> dict:
+        scan, store = self._asset_guard()
+        # 每次读取都把被动 mDNS 服务合并进统一设备池，保证「同一行展示」
+        if self.browse is not None:
+            store.merge_mdns(self.browse.json().get("items", []))
+        devices = store.devices(online=online, source=source, cidr=cidr, tag=tag)
+        return {"count": len(devices), "items": devices, "scan": scan.status()}
+
+    def scan_start(self, payload: dict) -> dict:
+        scan, _ = self._asset_guard()
+        return scan.start(
+            payload.get("cidr", ""),
+            confirm_large=bool(payload.get("confirm_large", False)),
+            interval_ms=payload.get("interval_ms"),
+            timeout_ms=payload.get("timeout_ms"),
+            max_concurrent=payload.get("max_concurrent"),
+            exclude_ips=payload.get("exclude_ips"),
+            mode=payload.get("mode"),
+            port_probe=payload.get("port_probe"),
+            port_template=payload.get("port_template"),
+            custom_ports=payload.get("custom_ports"),
+        )
+
+    def scan_stop(self) -> dict:
+        scan, _ = self._asset_guard()
+        return scan.stop()
+
+    def scan_status(self) -> dict:
+        scan, _ = self._asset_guard()
+        return scan.status()
+
+    # -- 资产元数据 / 快照 / 对比 / CSV / LanLink ---------------------------
+    def asset_set_meta(self, ip: str, payload: dict) -> dict:
+        _, store = self._asset_guard()
+        device = store.set_meta(
+            ip,
+            tags=payload.get("tags"),
+            remark=payload.get("remark"),
+            linked_mdns_record=payload.get("linked_mdns_record"),
+        )
+        if device is None:
+            raise FileNotFoundError(f"资产不存在: {ip}")
+        if self.asset_db is not None:
+            self.asset_db.upsert_device_meta(
+                ip, tags=device["tags"], remark=device["remark"],
+                linked_mdns_record=device["linked_mdns_record"])
+        return device
+
+    def asset_blacklist(self, ip: str) -> dict:
+        """把 IP 加入黑名单：持久化并即时更新当前扫描配置。"""
+        _, _ = self._asset_guard()
+        import ipaddress as _ip
+        try:
+            _ip.IPv4Address(ip)
+        except ValueError as exc:
+            raise ValueError(f"非法 IP: {ip}") from exc
+        excluded = list(self.cfg.asset.exclude_ips or [])
+        if ip not in excluded:
+            excluded.append(ip)
+        # 通过配置保存链路持久化（需调用方已完成管理员鉴权）
+        return self.save_config({"config": {
+            "asset": {"exclude_ips": excluded},
+        }})
+
+    def snapshot_create(self, payload: dict) -> dict:
+        _, store = self._asset_guard()
+        if self.asset_db is None:
+            raise RuntimeError("数据库未初始化")
+        result = self.asset_db.save_snapshot(
+            str(payload.get("name", "")).strip() or "未命名快照",
+            str(payload.get("note", "")), store.snapshot_items())
+        self.asset_events.publish("snapshot.created", snapshot=result)
+        return result
+
+    def snapshot_list(self) -> dict:
+        self._asset_guard()
+        if self.asset_db is None:
+            raise RuntimeError("数据库未初始化")
+        return {"items": self.asset_db.list_snapshots()}
+
+    def snapshot_detail(self, sid: int) -> dict:
+        self._asset_guard()
+        if self.asset_db is None:
+            raise RuntimeError("数据库未初始化")
+        result = self.asset_db.get_snapshot(sid)
+        if result is None:
+            raise FileNotFoundError(f"快照不存在: {sid}")
+        return result
+
+    def snapshot_delete(self, sid: int) -> dict:
+        self._asset_guard()
+        if self.asset_db is None:
+            raise RuntimeError("数据库未初始化")
+        return {"ok": self.asset_db.delete_snapshot(sid)}
+
+    def snapshot_diff(self, base_id: int, other_id: int) -> dict:
+        self._asset_guard()
+        if self.asset_db is None:
+            raise RuntimeError("数据库未初始化")
+        return self.asset_db.diff_snapshots(base_id, other_id)
+
+    def snapshot_csv(self, sid: int) -> str:
+        self._asset_guard()
+        if self.asset_db is None:
+            raise RuntimeError("数据库未初始化")
+        return self.asset_db.export_csv(sid)
+
+    def events_history(self, limit: int = 100) -> dict:
+        self._asset_guard()
+        return {"items": self.asset_events.history(limit),
+                "subscribers": self.asset_events.subscriber_count()}
+
+    def lanlink_config(self) -> dict:
+        """LanLink 联动配置：WS 地址与默认网段（PRD 7）。"""
+        self._asset_guard()
+        default_cidr = ""
+        for ip in _local_ipv4_interfaces():
+            if str(ip).startswith("127."):
+                continue
+            try:
+                import ipaddress as _ip
+                network = _ip.IPv4Network(f"{ip}/24", strict=False)
+                default_cidr = str(network)
+                break
+            except ValueError:
+                continue
+        return {
+            "ws_path": "/api/v1/devices/watch",
+            "scan_endpoint": "/api/v1/scan/start",
+            "default_cidr": default_cidr,
+            "event_types": ["device.add", "device.update", "device.offline",
+                            "scan.start", "scan.done"],
+        }
+
+    def register_asset_host(self, ip: str, payload: dict) -> dict:
+        """把扫描资产注册成静态 mDNS 记录（PRD 3.9），写入 [[hosts]] 并热重载。"""
+        _, store = self._asset_guard()
+        import ipaddress as _ip
+        try:
+            _ip.IPv4Address(ip)
+        except ValueError as exc:
+            raise ValueError(f"非法 IP: {ip}") from exc
+        devices = store.devices()
+        device = next((d for d in devices if d["ip"] == ip), None)
+        if device is None:
+            raise FileNotFoundError(f"资产不存在: {ip}")
+        octets = ip.split(".")
+        suggested = str(payload.get("name") or "").strip() or \
+            f"dev-{'-'.join(octets)}.local"
+        name = suggested if suggested.endswith(".local") else suggested + ".local"
+        # 复用 save_config 链路：添加 [[hosts]] 并触发热重载
+        current = [{"name": h.name, "ip": h.ip} for h in self.cfg.hosts]
+        if not any(h["ip"] == ip for h in current):
+            current.append({"name": name, "ip": ip})
+        self.save_config({"config": {"hosts": current}})
+        # 关联 ID 回写设备池与数据库
+        store.set_meta(ip, linked_mdns_record=name)
+        if self.asset_db is not None:
+            self.asset_db.upsert_device_meta(ip, linked_mdns_record=name)
+        return {"ok": True, "name": name, "ip": ip, "id": name,
+                "linked_mdns_record": name}
 
     def records_json(self) -> list[dict]:
         return [{
@@ -1238,12 +1458,26 @@ class Responder:
                     # 必须回显 proxy，否则界面永远把开关显示成"开"，刷新即还原。
                     "proxy": s.proxy,
                 } for s in self.cfg.services],
+                "asset": ({
+                    "enabled": self.cfg.asset.enabled,
+                    "interval_ms": self.cfg.asset.interval_ms,
+                    "timeout_ms": self.cfg.asset.timeout_ms,
+                    "max_concurrent": self.cfg.asset.max_concurrent,
+                    "exclude_ips": list(self.cfg.asset.exclude_ips),
+                    "mode": getattr(self.cfg.asset, "mode", "arp+icmp"),
+                    "port_probe": getattr(self.cfg.asset, "port_probe", False),
+                    "port_template": getattr(self.cfg.asset, "port_template", ""),
+                    "custom_ports": list(getattr(self.cfg.asset, "custom_ports", [])),
+                    "port_timeout_ms": getattr(self.cfg.asset, "port_timeout_ms", 300),
+                    "retention_days": getattr(self.cfg.asset, "retention_days", 7),
+                    "oui_size": (DEFAULT_LOOKUP.size if LAN_ASSET_AVAILABLE else 0),
+                } if self.cfg.asset is not None else None),
             },
         }
 
     def save_config(self, payload: dict) -> dict:
         """校验 -> 备份 -> 原子替换 -> 标记热重载。任何校验失败都不改动原文件。"""
-        from admin_server import dump_toml, merge_server
+        from admin_server import dump_toml, merge_asset, merge_server
 
         if isinstance(payload.get("raw"), str):
             text = payload["raw"]
@@ -1252,6 +1486,16 @@ class Responder:
                 current_raw = fh.read()
             cfg = dict(payload["config"])
             cfg["server"] = merge_server(current_raw, cfg.get("server", {}))
+            cfg["asset"] = merge_asset(current_raw, cfg.get("asset"))
+            # 部分更新（如静态注册 / 黑名单只改一段）必须保留未提交的 hosts/services，
+            # 否则 dump_toml 会丢失这些段，造成服务发布被静默清空。
+            if "hosts" not in cfg or "services" not in cfg:
+                try:
+                    original = tomllib.loads(current_raw)
+                except (tomllib.TOMLDecodeError, AttributeError):
+                    original = {}
+                cfg.setdefault("hosts", original.get("hosts", []))
+                cfg.setdefault("services", original.get("services", []))
             text = dump_toml(cfg)
         else:
             raise ConfigError("请求体需包含 raw 或 config")
@@ -1443,6 +1687,8 @@ class Responder:
             on_health=new_cfg.server.alert_on_health,
             on_conflict=new_cfg.server.alert_on_conflict)
         self.history.limit = new_cfg.server.history_limit
+        if self.asset_scan is not None and new_cfg.asset is not None:
+            self.asset_scan.configure(new_cfg.asset)
         if server_changed:
             LOG.warning("server.interface/group/port 变更需重启进程才能生效")
         self._reset_periodic()
@@ -1675,6 +1921,10 @@ class Responder:
             self.net.close()
         if self.health is not None:
             self.health.stop()
+        if self.asset_scan is not None:
+            self.asset_scan.close()          # 关闭/切走时自动取消扫描任务
+        if self.asset_db is not None:
+            self.asset_db.close()
         self.alerts.stop()
         LOG.info("已停止")
         return 0

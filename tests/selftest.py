@@ -888,6 +888,222 @@ def platform_features() -> None:
     check(metrics.endswith("\n"), "指标以换行结束")
 
 
+def asset_module() -> None:
+    print("\n[13] LanAsset 主动探测（默认关闭 / 限速 / 取消 / 设备池合并）")
+    import lan_asset
+    from lan_asset import (AssetStore, ScanManager, config_from_dict,
+                           iter_targets, requires_confirmation)
+
+    cfg = config_from_dict({})
+    check(cfg.enabled is False, "资产扫描模块默认关闭")
+    check((cfg.interval_ms, cfg.timeout_ms, cfg.max_concurrent) == (200, 800, 16),
+          "默认限速 200ms / 超时 800ms / 并发 16")
+    for bad in ({"interval_ms": 5}, {"timeout_ms": 99999},
+                {"max_concurrent": 0}, {"exclude_ips": ["not-an-ip"]}):
+        try:
+            config_from_dict(bad)
+            check(False, f"非法资产配置应被拒绝: {bad}")
+        except ValueError:
+            check(True, f"非法资产配置被拒绝: {list(bad)[0]}")
+
+    targets = iter_targets("192.168.1.0/30", ["192.168.1.1"])
+    check(targets == ["192.168.1.2"], "CIDR 枚举与排除 IP 生效")
+    try:
+        iter_targets("0.0.0.0/0")
+        check(False, "0.0.0.0/0 全网扫描应被拒绝")
+    except ValueError:
+        check(True, "禁止 0.0.0.0/0 全网扫描")
+    check(requires_confirmation("10.0.0.0/16")
+          and not requires_confirmation("192.168.1.0/24"),
+          "大网段需二次确认，/24 无需确认")
+
+    store = AssetStore()
+    store.update_scan("192.168.1.10", True, "ping")
+    merged = store.merge_mdns([{
+        "host_ip": "192.168.1.10", "instance": "Office Web",
+        "type": "_http._tcp.local", "port": 8080, "host": "nas.local",
+        "txt": "path=/", "last_seen": time.time(),
+    }])
+    check(merged == 1, "mDNS 服务合并进既有扫描资产")
+    merged_again = store.merge_mdns([{
+        "host_ip": "192.168.1.10", "instance": "Office Web",
+        "type": "_http._tcp.local", "port": 8080,
+    }])
+    check(merged_again == 0, "重复 mDNS 服务不会重复合并")
+    device = store.devices(cidr="192.168.1.0/24")[0]
+    check(device["sources"] == ["icmp", "mdns"], "同一资产保留多来源标签")
+    check(len(device["services"]) == 1 and device["services"][0]["port"] == 8080,
+          "mDNS 服务字段回填到统一设备")
+    check(len(store.devices(source="mdns")) == 1
+          and len(store.devices(online=False)) == 0,
+          "设备池支持来源与在线状态过滤")
+
+    disabled = ScanManager(AssetStore(), cfg)
+    try:
+        disabled.start("192.168.1.0/30")
+        check(False, "模块关闭时不应允许扫描")
+    except RuntimeError:
+        check(True, "模块关闭时扫描 API 被拒绝")
+
+    original_probe = lan_asset.probe_host_full
+    lan_asset.probe_host_full = lambda ip, timeout, **kw: {
+        "online": ip.endswith(".2"), "method": "ping", "mac": "",
+        "vendor": "Unknown", "ports": [], "arp_unavailable": False}
+    try:
+        enabled = config_from_dict({"enabled": True, "interval_ms": 10,
+                                    "timeout_ms": 50, "max_concurrent": 4})
+        fast_store = AssetStore()
+        manager = ScanManager(fast_store, enabled)
+        status = manager.start("192.168.1.0/29",
+                               exclude_ips=["192.168.1.1"])
+        check(status["state"] == "running" and status["stats"]["total"] == 5,
+              "扫描启动返回进度状态")
+        deadline = time.time() + 3
+        while manager.status()["state"] == "running" and time.time() < deadline:
+            time.sleep(0.02)
+        final = manager.status()
+        check(final["state"] == "done" and final["stats"]["scanned"] == 5,
+              "扫描完成并增量写入设备池")
+        check(final["stats"]["online"] == 1 and final["stats"]["offline"] == 4,
+              "在线/离线统计正确，离线资产不删除")
+        check(any(e["kind"] == "scan.done" for e in final["events"]),
+              "扫描事件登记")
+
+        slow = ScanManager(AssetStore(), config_from_dict(
+            {"enabled": True, "interval_ms": 1000, "timeout_ms": 50,
+             "max_concurrent": 2}))
+        slow.start("192.168.1.0/24")
+        time.sleep(0.05)
+        stopped = slow.stop()
+        check(stopped["state"] in ("stopped", "done"), "扫描任务可随时取消")
+        slow.close()
+    finally:
+        lan_asset.probe_host_full = original_probe
+
+    from admin_server import dump_toml, merge_asset
+    saved = dump_toml({
+        "server": {"port": 5353},
+        "asset": {"enabled": True, "interval_ms": 120, "timeout_ms": 900,
+                  "max_concurrent": 8, "exclude_ips": ["192.168.1.1"]},
+    })
+    check("[asset]" in saved and "enabled = true" in saved
+          and "interval_ms = 120" in saved and 'exclude_ips = ["192.168.1.1"]' in saved,
+          "结构化保存后 [asset] 段完整保留")
+    kept = merge_asset("[asset]\nenabled = true\ninterval_ms = 333\n", None)
+    check(kept.get("enabled") is True and kept.get("interval_ms") == 333,
+          "表单未提交 asset 时沿用原配置")
+
+
+def asset_extended() -> None:
+    print("\n[14] LanAsset 扩展（OUI / 端口探针 / 快照对比 / CSV / WS 帧 / 静态注册）")
+    import tempfile
+    from pathlib import Path
+    from asset_oui import lookup_vendor, OUILookup
+    from asset_events import (DeviceEventBus, ws_accept_key, ws_text_frame,
+                              ws_pong_frame, encode_event, EV_DEVICE_ADD)
+    from asset_db import AssetDatabase
+
+    # OUI 离线查询
+    check(lookup_vendor("B8:27:EB:11:22:33") == "Raspberry Pi", "OUI 命中内置前缀")
+    check(lookup_vendor("FF:FF:FF:11:22:33") == "Unknown", "OUI 未匹配显示 Unknown")
+    extra = Path(tempfile.mkdtemp()) / "oui.json"
+    extra.write_text('{"AABBCC": "测试厂商"}', encoding="utf-8")
+    check(OUILookup(str(extra)).lookup("AA:BB:CC:00:11:22") == "测试厂商",
+          "外部 OUI 库可叠加")
+
+    # 端口模板 / 配置解析
+    from lan_asset import config_from_dict as cfgd, probe_ports, PORT_TEMPLATES
+    check(PORT_TEMPLATES["dev"] == [22, 80, 443, 3000], "开发端口模板正确")
+    check(PORT_TEMPLATES["industrial"] == [502, 1883, 8080], "工控端口模板正确")
+    c = cfgd({"enabled": True, "mode": "icmp", "port_probe": True,
+              "port_template": "dev", "custom_ports": [9000, 22]})
+    check(c.resolved_ports() == [22, 80, 443, 3000, 9000], "端口模板+自定义去重有序")
+    check(cfgd({"port_probe": False}).resolved_ports() == [], "端口探针默认关闭")
+    try:
+        cfgd({"mode": "nmap"})
+        check(False, "非法探测模式应被拒绝")
+    except ValueError:
+        check(True, "非法探测模式被拒绝")
+
+    # 端口探针真实回环测试（连一个必然关闭的端口）
+    ports = probe_ports("127.0.0.1", [1, 65535], 100, 2)
+    check(len(ports) == 2 and all(p["port"] in (1, 65535) and not p["open"]
+                                  for p in ports), "端口探针返回结构化结果且关闭端口判离线")
+
+    # 事件总线
+    bus = DeviceEventBus()
+    sub = bus.subscribe()
+    item = bus.publish(EV_DEVICE_ADD, ip="10.0.0.1")
+    check(sub.get_nowait()["event"] == EV_DEVICE_ADD, "事件总线发布/订阅正常")
+    check(any(x["id"] == item["id"] for x in bus.history()), "事件历史可查询")
+
+    # WS 协议工具（RFC 6455 已知向量）
+    check(ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+          "WS Sec-WebSocket-Accept RFC 向量正确")
+    frame = ws_text_frame("你好")
+    check(frame[0] == 0x81 and frame[1] == 0x86, "WS 文本帧头正确（UTF-8 长度）")
+    check(ws_pong_frame(b"x")[0] == 0x8A, "WS pong 帧操作码正确")
+    check(b'"event"' in encode_event({"event": "scan.start"}), "事件编码为 WS 文本帧")
+
+    # SQLite 快照 / 对比 / CSV
+    db = AssetDatabase(str(Path(tempfile.mkdtemp()) / "assets.sqlite3"))
+    db.save_scan_config({"mode": "arp+icmp", "exclude_ips": ["192.168.1.1"]})
+    check(db.load_scan_config()["mode"] == "arp+icmp", "扫描配置持久化")
+    db.upsert_device_meta("10.0.0.9", tags=["plc"], remark="车间", linked_mdns_record=None)
+    check("plc" in db.device_meta("10.0.0.9")["tags"], "设备标签/备注持久化")
+    base = [
+        {"ip": "10.0.0.9", "mac": "AA:BB:CC:00:00:01", "vendor": "X", "online": True,
+         "sources": ["arp"], "detected_ports": [{"port": 502, "proto": "tcp", "open": True}],
+         "tags": ["plc"], "remark": "", "last_seen": time.time()},
+        {"ip": "10.0.0.10", "mac": "", "vendor": "Unknown", "online": True,
+         "sources": ["icmp"], "detected_ports": [], "tags": [], "remark": "",
+         "last_seen": time.time()},
+    ]
+    s1 = db.save_snapshot("基线", "", base)
+    other = [
+        dict(base[0], mac="AA:BB:CC:00:00:99", detected_ports=[]),
+        {"ip": "10.0.0.11", "mac": "", "vendor": "Unknown", "online": True,
+         "sources": ["mdns"], "detected_ports": [], "tags": [], "remark": "",
+         "last_seen": time.time()},
+    ]
+    s2 = db.save_snapshot("变更", "", other)
+    check(len(db.list_snapshots()) == 2, "快照列表正确")
+    diff = db.diff_snapshots(s1["id"], s2["id"])
+    check(diff["summary"] == {"added": 1, "removed": 1, "changed": 1},
+          "快照对比统计新增/消失/变更")
+    check("MAC 变更" in diff["changed"][0]["changes"], "MAC 变更被识别")
+    csv_text = db.export_csv(s1["id"])
+    check("IP,MAC,厂商,端口,来源" in csv_text and "10.0.0.9" in csv_text,
+          "CSV 导出含标准表头与资产")
+    check(db.delete_snapshot(s2["id"]) and len(db.list_snapshots()) == 1,
+          "快照删除生效")
+    db.close()
+
+    # 配置回显新字段 + dump_toml 往返
+    from admin_server import dump_toml
+    saved = dump_toml({"server": {"port": 5353},
+        "hosts": [{"name": "test.local", "ip": "127.0.0.1"}], "asset": {
+        "enabled": True, "mode": "icmp", "port_probe": True,
+        "port_template": "industrial", "custom_ports": [9000],
+        "port_timeout_ms": 400, "retention_days": 0,
+        "interval_ms": 200, "timeout_ms": 800, "max_concurrent": 16,
+        "exclude_ips": [], "oui_extra_path": "",
+    }})
+    check('mode = "icmp"' in saved and "port_probe = true" in saved
+          and "custom_ports = [9000]" in saved and "retention_days = 0" in saved,
+          "扩展 asset 字段完整写入 TOML")
+    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False,
+                                     encoding="utf-8") as fh:
+        fh.write(saved)
+        tmp = fh.name
+    from mdns_responder import load_config
+    reparsed = load_config(tmp)
+    check(reparsed.asset.mode == "icmp" and reparsed.asset.port_probe is True
+          and reparsed.asset.custom_ports == [9000] and reparsed.asset.retention_days == 0,
+          "扩展 asset 字段 TOML 往返无损")
+    os.unlink(tmp)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--offline", action="store_true", help="仅运行离线报文测试")
@@ -896,6 +1112,8 @@ def main() -> int:
     args = parser.parse_args()
     offline()
     insights()
+    asset_module()
+    asset_extended()
     platform_features()
     log_rotation()
     friendly_page()

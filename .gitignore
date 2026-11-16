@@ -24,6 +24,10 @@ __pycache__/
 .js_check.js
 *.tmp
 
+# 工作区元数据 / 环境回收站
+.workbuddy/
+.Trash-0/
+
 # 编辑器 / 系统
 .vscode/
 .idea/
