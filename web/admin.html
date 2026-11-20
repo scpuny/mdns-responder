@@ -598,7 +598,7 @@ function loadDemo(){
 }
 async function refreshAll(){
   const st=await api('/api/status');S.status=st;
-  const [cfg,rec,logs,ifaces,health,queries,browse,conflicts,auth,hist,alerts,tlsStatus]=await Promise.all([
+  const [cfg,rec,logs,ifaces,health,queries,browse,conflicts,auth,hist,alerts,tlsStatus,tlsDomains]=await Promise.all([
     api('/api/config'),api('/api/records'),api('/api/logs?limit=300'),api('/api/interfaces'),
     api('/api/health').catch(function(){return {enabled:false,items:[]};}),
     api('/api/queries?limit=100').catch(function(){return {enabled:false,items:[],total:0};}),

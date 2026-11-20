@@ -1086,6 +1086,14 @@ cert_days = 30
         rejected = True
     check(rejected, "拒绝通配符域名（单域名证书不支持）")
 
+    # 管理台启动回归：refreshAll() 解构必须接收 /api/tls/domains 的结果。
+    # 缺少该变量会在所有 API 成功后抛 ReferenceError，boot() 误判为连不上后端并进入演示模式。
+    with open(os.path.join(ROOT, "web", "admin.html"), encoding="utf-8") as fh:
+        compact = "".join(fh.read().split())
+    check("tlsStatus,tlsDomains]=awaitPromise.all" in compact
+          and "S.tlsDomains=tlsDomains;" in compact,
+          "管理台 refreshAll 解构包含 tlsDomains（避免误入演示模式）")
+
 
 def _txt_offsets(rdata: bytes) -> list[int]:
     offsets: list[int] = []
