@@ -245,7 +245,8 @@ txt      = { path = "/", version = "1.0" }
 
 ```toml
 [tls]
-enabled = true
+enabled = true                      # 新增独立 HTTPS 网关，不改 80/8765 的 HTTP
+port = 443                          # HTTPS 监听端口；SNI 命中时自动选对应域名证书链
 cert_file = "certs/server.crt"      # 服务器证书（含 SAN：域名 + IP）
 key_file  = "certs/server.key"      # 私钥，权限 0600
 ca_file   = "certs/ca.crt"          # 自签 CA 证书
@@ -263,10 +264,12 @@ publish_service = true              # 发布 _https._tcp.local，TXT 携带 CA �
    import mdns_tls as t; ..."`（见 `src/mdns_tls.py` 的 `generate_ca` / `generate_server_cert`）。
 3. **导入现有 PEM**：把已有证书/私钥放到配置指定路径即可；支持私有 CA 签发的证书链。
 
-启用后管理台与 HTTP 网关都改用 TLS；**需重启进程**才会切换监听协议（热重载只更新配置与 mDNS 记录）。
-证书缺失或格式错误时自动降级为 HTTP 并在日志中报错，不影响 mDNS 主服务。
+启用后会**新增一个独立的 HTTPS 网关**（默认 443），不会把现有 80 网关 / 8765 管理台改成 TLS，
+因此 `http://*.local` 与本地管理台链路保持不变；**需重启进程**才会开启监听（热重载只更新配置与 mDNS 记录）。
+HTTPS 网关按 Host 头分发，与 HTTP 网关行为一致；SNI 命中 `certs/domains/<域名>/` 时自动换用该域名证书链。
+证书缺失或格式错误时只关闭 HTTPS 并在日志中报错，不影响 mDNS 主服务与 HTTP 入口。
 
-mDNS 服务发现：启用后发布 `_https._tcp.local`（PTR + SRV + TXT + A），
+mDNS 服务发现：启用后发布 `_https._tcp.local`（PTR + SRV + TXT + A），SRV 端口即 `tls.port`，
 TXT 中包含 `tls=1`、`version=<TLS 版本>`、`path=/`、`ca_fp=sha256:<CA 指纹>`，
 客户端可用该指纹做证书固定（certificate pinning）。
 CA 证书可通过公开的 `GET /api/tls/ca.pem`（或 `/ca.pem`）下载并安装到客户端信任库。
@@ -288,8 +291,8 @@ CA 证书可通过公开的 `GET /api/tls/ca.pem`（或 `/ca.pem`）下载并安
 - 部署到 Traefik / Ingress 时用 `fullchain.pem` + `key.pem`；**这与 mDNS 的 SRV 端口无关**，
   DNS 只负责把域名解析到入口 IP，TLS 在入口按 Host 头分发后终结。
 
-> 注意：这里的 HTTPS 监听开关 `[tls] enabled` 只作用于 mDNS Studio 自身的 8765/80 端口；
-> 给业务域名签发的证书是**独立文件**，供你在 Traefik / K3s 侧配置，两者互不影响。
+> 注意：`[tls] enabled` 开启的是 mDNS Studio 自己的独立 HTTPS 网关（默认 443，按 SNI 选证书），
+> 不会改动 80 / 8765 的 HTTP；这些域名证书文件同时也可供 Traefik / K3s 侧配置，两者互不影响。
 > 业务服务报"不安全"的根因是它自己的证书不被信任——用这里的 CA 给该域名签证书并部署、
 > 再把 CA 装进客户端信任库，才能消除告警。
 

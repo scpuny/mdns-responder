@@ -250,7 +250,7 @@ SERVER_FIELDS = (
 
 
 TLS_FIELDS = (
-    ("enabled", bool), ("cert_file", str), ("key_file", str),
+    ("enabled", bool), ("port", int), ("cert_file", str), ("key_file", str),
     ("ca_file", str), ("ca_key_file", str), ("min_version", str),
     ("client_auth", str), ("redirect_http", bool), ("publish_service", bool),
     ("service_instance", str), ("service_host", str),
@@ -1104,21 +1104,49 @@ def start_gateway(responder, log_handler: RingLogHandler | None = None):
     except OSError as exc:
         LOG.warning("HTTP 网关启动失败（不影响 mDNS 服务）: %s", exc)
         return None
-    scheme = "http"
-    tls_cfg = getattr(responder.cfg, "tls", None)
-    if tls_cfg is not None and tls_cfg.enabled:
-        from mdns_tls import make_ssl_context
-        try:
-            ctx = make_ssl_context(tls_cfg, os.path.dirname(responder.config_path))
-            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-            scheme = "https"
-        except (OSError, ssl.SSLError, ValueError) as exc:
-            LOG.error("HTTP 网关 HTTPS 启用失败，降级为 HTTP: %s", exc)
     thread = threading.Thread(target=httpd.serve_forever, name="mdns-gateway", daemon=True)
     thread.start()
     admin_hint = server_cfg.gateway_admin_host or "(本机 IP 或 /admin)"
-    LOG.info("HTTP 网关已启动: %s://0.0.0.0:%d/  (管理台域名=%s)",
-             scheme, server_cfg.gateway_port, admin_hint)
+    LOG.info("HTTP 网关已启动: http://0.0.0.0:%d/  (管理台域名=%s)",
+             server_cfg.gateway_port, admin_hint)
+    return httpd
+
+
+def start_https_gateway(responder, log_handler: RingLogHandler | None = None):
+    """独立 HTTPS 网关（默认 443）：SNI 选证书，Host 路由与 HTTP 网关一致。
+
+    刻意不改动 80 / 8765 的协议：现有 http://*.local 链路继续工作，
+    HTTPS 只是新增入口。端口冲突 / 证书异常只影响 HTTPS，不阻断 mDNS 主服务。
+    """
+    tls_cfg = getattr(responder.cfg, "tls", None)
+    if tls_cfg is None or not tls_cfg.enabled:
+        return None
+    server_cfg = responder.cfg.server
+    handler = log_handler or install_logging()
+    try:
+        httpd = HTTPGatewayServer(
+            ("0.0.0.0", tls_cfg.port),
+            GatewayHandler, responder, handler, server_cfg.management_token,
+            gateway_admin_host=server_cfg.gateway_admin_host,
+            gateway_timeout=server_cfg.gateway_timeout,
+            gateway_enabled=True,
+        )
+    except OSError as exc:
+        LOG.warning("HTTPS 网关启动失败（不影响 mDNS 服务）: %s", exc)
+        return None
+    try:
+        from mdns_tls import make_gateway_ssl_context
+        ctx = make_gateway_ssl_context(tls_cfg, os.path.dirname(responder.config_path))
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    except (OSError, ssl.SSLError, ValueError) as exc:
+        LOG.error("HTTPS 网关启用失败（保留现有 HTTP 服务）: %s", exc)
+        httpd.server_close()
+        return None
+    responder.tls_active = True
+    thread = threading.Thread(target=httpd.serve_forever, name="mdns-https", daemon=True)
+    thread.start()
+    LOG.info("HTTPS 网关已启动: https://0.0.0.0:%d/  (管理台域名=%s)",
+             tls_cfg.port, server_cfg.gateway_admin_host or "(本机 IP 或 /admin)")
     return httpd
 
 
@@ -1136,21 +1164,10 @@ def start_admin(responder, log_handler: RingLogHandler | None = None):
     except OSError as exc:
         LOG.warning("管理界面启动失败（不影响 mDNS 服务）: %s", exc)
         return None
-    scheme = "http"
-    tls_cfg = getattr(responder.cfg, "tls", None)
-    if tls_cfg is not None and tls_cfg.enabled:
-        from mdns_tls import make_ssl_context
-        try:
-            ctx = make_ssl_context(tls_cfg, os.path.dirname(responder.config_path))
-            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-            scheme = "https"
-            responder.tls_active = True
-        except (OSError, ssl.SSLError, ValueError) as exc:
-            LOG.error("管理界面 HTTPS 启用失败，降级为 HTTP（不影响 mDNS 服务）: %s", exc)
     thread = threading.Thread(target=httpd.serve_forever, name="mdns-admin", daemon=True)
     thread.start()
     host = server_cfg.management_host
-    LOG.info("管理界面已启动: %s://%s:%d/", scheme, host, server_cfg.management_port)
+    LOG.info("管理界面已启动: http://%s:%d/", host, server_cfg.management_port)
     return httpd
 
 

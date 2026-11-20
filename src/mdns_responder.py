@@ -609,6 +609,7 @@ def load_config(path: str) -> Config:
         raise ConfigError("tls 必须是表")
     tls = TLSConfig(
         enabled=_as_bool(tls_raw.get("enabled", False), "tls.enabled"),
+        port=_as_int(tls_raw.get("port", 443), "tls.port"),
         cert_file=_as_str(tls_raw.get("cert_file", "certs/server.crt"), "tls.cert_file"),
         key_file=_as_str(tls_raw.get("key_file", "certs/server.key"), "tls.key_file"),
         ca_file=_as_str(tls_raw.get("ca_file", "certs/ca.crt"), "tls.ca_file"),
@@ -627,6 +628,13 @@ def load_config(path: str) -> Config:
         tls.validate()
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
+    if tls.enabled:
+        occupied = {server.port, server.management_port}
+        if server.gateway:
+            occupied.add(server.gateway_port)
+        if tls.port in occupied:
+            raise ConfigError(
+                f"tls.port={tls.port} 与已占用的服务端口冲突（{sorted(occupied)}）")
 
     if not hosts and not services:
         raise ConfigError("配置中没有任何 hosts 或 services，服务不会发布任何记录")
@@ -781,14 +789,14 @@ def build_records(cfg: Config) -> tuple[list[Record], dict[str, Record]]:
                 bytes([len(b)]) + b
                 for b in sorted(_txt_bytes(f"{k}={v}") for k, v in txt.items())
             )
-            srv_rdata = struct.pack("!HHH", 0, 0, cfg.server.management_port) + encode_name(host_name)
+            srv_rdata = struct.pack("!HHH", 0, 0, tls_cfg.port) + encode_name(host_name)
             srv_key = f"srv:{instance_fqdn.lower()}"
             txt_key = f"txt:{instance_fqdn.lower()}"
             ptr_key = f"ptr:{svc_type.lower()}:{instance_fqdn.lower()}"
             add(Record(
                 key=srv_key, name=instance_fqdn, rtype=TYPE_SRV, rdata=srv_rdata,
                 ttl=ttl, flush=True, extras=(a_key, txt_key),
-                display=f"SRV  {instance_fqdn}. -> 0 0 {cfg.server.management_port} {host_name}.",
+                display=f"SRV  {instance_fqdn}. -> 0 0 {tls_cfg.port} {host_name}.",
             ))
             add(Record(
                 key=txt_key, name=instance_fqdn, rtype=TYPE_TXT, rdata=txt_rdata,
@@ -1079,6 +1087,7 @@ class Responder:
         self.stats = {"queries": 0, "responses": 0, "bytes": 0, "announces": 0}
         self.admin = None
         self.gateway = None
+        self.https_gateway = None
         # 可观测增强：查询审计 / 局域网浏览 / 冲突检测（mdns_insights）
         from mdns_insights import BrowseState, ConflictState, HealthMonitor, QueryAudit
         srv = self.cfg.server
@@ -1164,6 +1173,13 @@ class Responder:
         if log_path and not os.path.isabs(log_path):
             log_path = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))), log_path)
+        tls_cfg = getattr(self.cfg, "tls", None)
+        https_active = bool(getattr(self, "tls_active", False))
+        https_host = (srv.gateway_admin_host or "mdns.local").strip()
+        https_url = ""
+        if https_active and tls_cfg:
+            suffix = "" if tls_cfg.port == 443 else f":{tls_cfg.port}"
+            https_url = f"https://{https_host}{suffix}/"
         return {
             "running": self.running,
             "pid": os.getpid(),
@@ -1180,9 +1196,14 @@ class Responder:
             "reverse_ptr": srv.reverse_ptr,
             "management": {
                 "enabled": srv.management,
-                "url": f"{'https' if getattr(self, 'tls_active', False) else 'http'}://"
-                       f"{srv.management_host}:{srv.management_port}/",
+                "url": f"http://{srv.management_host}:{srv.management_port}/",
                 "auth_required": bool(srv.management_token),
+            },
+            "https": {
+                "enabled": bool(tls_cfg and tls_cfg.enabled),
+                "active": https_active,
+                "port": tls_cfg.port if tls_cfg else 443,
+                "url": https_url,
             },
             "logging": {
                 "enabled": bool(srv.log_file.strip()),
@@ -1528,7 +1549,7 @@ class Responder:
                     "history_limit": srv.history_limit,
                 },
                 "tls": ({
-                    "enabled": t.enabled, "cert_file": t.cert_file,
+                    "enabled": t.enabled, "port": t.port, "cert_file": t.cert_file,
                     "key_file": t.key_file, "ca_file": t.ca_file,
                     "ca_key_file": t.ca_key_file, "min_version": t.min_version,
                     "client_auth": t.client_auth, "redirect_http": t.redirect_http,
@@ -1606,6 +1627,18 @@ class Responder:
                 new_cfg.server.interface != self.cfg.server.interface
                 or new_cfg.server.group != self.cfg.server.group
                 or new_cfg.server.port != self.cfg.server.port
+                or (
+                    (new_cfg.tls is None) != (self.cfg.tls is None)
+                    or (
+                        new_cfg.tls is not None
+                        and self.cfg.tls is not None
+                        and any(
+                            getattr(new_cfg.tls, k) != getattr(self.cfg.tls, k)
+                            for k in ("enabled", "port", "cert_file", "key_file",
+                                      "ca_file", "min_version", "client_auth")
+                        )
+                    )
+                )
             ),
         }
 
@@ -1925,10 +1958,12 @@ class Responder:
         if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, self._on_hup)
 
-        from admin_server import install_logging, start_admin, start_gateway, stop_admin
+        from admin_server import (
+            install_logging, start_admin, start_gateway, start_https_gateway, stop_admin)
         log_handler = install_logging(self.cfg.server)
         self.admin = start_admin(self, log_handler=log_handler)
         self.gateway = start_gateway(self, log_handler=log_handler)
+        self.https_gateway = start_https_gateway(self, log_handler=log_handler)
         self._sync_health_thread()
         LOG.info("mDNS responder 已启动 (pid=%d)", os.getpid())
         last_housekeeping = time.monotonic()
@@ -1981,6 +2016,8 @@ class Responder:
         finally:
             stop_admin(self.admin)
             stop_admin(self.gateway)
+            stop_admin(self.https_gateway)
+            self.tls_active = False
             self.net.close()
         if self.health is not None:
             self.health.stop()

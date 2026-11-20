@@ -56,7 +56,8 @@ gateway_timeout = 6.0               # 反代到后端的连接超时（秒）
 # 路径相对本配置文件所在目录。启用后管理台与网关均改用 TLS；需重启进程生效。
 # 不启用时下方所有字段都不生效，现有 HTTP 部署行为完全不变。
 [tls]
-enabled = false
+enabled = false                      # 启用后新增独立 HTTPS 监听，不改 80/8765 的 HTTP
+port = 443                           # HTTPS 网关端口；SNI 命中时自动选对应域名证书
 cert_file = "certs/server.crt"       # 服务器证书（含 SAN：localhost + 域名 + IP）
 key_file = "certs/server.key"        # 服务器私钥，自动生成时权限 0600
 ca_file = "certs/ca.crt"             # 自签 CA 证书，可浏览器中安装信任

@@ -979,6 +979,7 @@ function viewTls(){
   const cert=st.certificate||{},ca=st.ca||{};
   const badge=function(ok,yes,no){return '<span class="badge '+(ok?'b-SRV':'b-OTHER')+'">'+(ok?yes:no)+'</span>';};
   const form='<div class="form-grid">'+
+    tlsField('port','HTTPS 端口',t.port||443,'默认 443；独立于 80/8765')+
     tlsField('cert_file','服务器证书 PEM',t.cert_file||'certs/server.crt')+
     tlsField('key_file','服务器私钥 PEM',t.key_file||'certs/server.key')+
     tlsField('ca_file','CA 证书 PEM',t.ca_file||'certs/ca.crt')+
@@ -991,7 +992,7 @@ function viewTls(){
     tlsField('ca_days','CA 有效期 (天)',t.ca_days||730)+
     tlsField('cert_days','服务器证书有效期 (天)',t.cert_days||365)+
     '</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 26px;margin-top:12px;border-top:1px solid var(--line-soft);padding-top:8px">'+
-    tlsSwitch('enabled','启用 HTTPS',!!t.enabled,'管理台与网关改用 TLS监听；文件缺失时自动降级 HTTP')+
+    tlsSwitch('enabled','启用 HTTPS',!!t.enabled,'新增独立 HTTPS 网关（默认 443），现有 80/8765 保持 HTTP；需重启生效')+
     tlsSwitch('publish_service','发布 HTTPS 服务发现',t.publish_service!==false,'广播 _https._tcp.local，TXT 携带 CA 指纹')+
     '</div>';
   const statusBody='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px">'+
@@ -1009,7 +1010,7 @@ function viewTls(){
     '<button class="btn ghost" data-act="tls-generate">'+icon('refresh',14)+' 生成自签 CA + 服务器证书</button>'+
     '<a class="btn ghost" href="/api/tls/ca.pem" target="_blank" download="mdns-studio-ca.crt">'+icon('download',14)+' 下载 CA 证书</a></div>'+
     '<div style="margin-top:14px;padding:14px 16px;border-radius:14px;background:var(--bg-soft);border:1px solid var(--line-soft);font-size:11.5px;color:var(--ink-3);line-height:1.8">'+
-    '签发使用系统 openssl（标准库仅负责 TLS 运行期）。启用 HTTPS 后需<b>重启进程</b>才会切换监听协议；热重载只更新配置与 mDNS 记录。客户端安装 CA 后即可信任本地证书，也可用 TXT 中的 <span class="mono">ca_fp</span> 做指纹固定。</div>';
+    '签发使用系统 openssl（标准库仅负责 TLS 运行期）。启用 HTTPS 后需<b>重启进程</b>才会开启独立监听；热重载只更新配置与 mDNS 记录。HTTPS 不占用 80/8765，浏览器可直接访问 <span class="mono">https://域名/</span>；SNI 命中已签发域名时自动使用对应证书链。客户端安装 CA 后即可信任本地证书，也可用 TXT 中的 <span class="mono">ca_fp</span> 做指纹固定。</div>';
   const dl=S.tlsDomains||{domains:[],ca_ready:false,ca:{}};
   const domains=dl.domains||[];
   const caFp=dl.ca_fingerprint||(dl.ca&&dl.ca.fingerprint)||'';
@@ -1146,7 +1147,7 @@ function syncFromDom(){
   const tls={};
   document.querySelectorAll('[data-tls]').forEach(function(el){
     const k=el.dataset.tls,v=String(el.value||'').trim();
-    if(/^(ca_days|cert_days)$/.test(k))tls[k]=Number(v||0);
+    if(/^(port|ca_days|cert_days)$/.test(k))tls[k]=Number(v||0);
     else tls[k]=v;
   });
   ['enabled','publish_service'].forEach(function(k){

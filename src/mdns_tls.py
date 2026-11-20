@@ -10,6 +10,8 @@ mdns_tls.py - HTTPS 与自签 CA 证书管理（零第三方 pip 依赖）
 * 证书**签发**需要 X.509 工具，调用系统 ``openssl`` CLI（Linux/macOS/容器基础镜像
   普遍自带）。openssl 不可用时给出明确错误，不影响 mDNS 主服务。
 * 默认关闭：``[tls] enabled = false``，现有 HTTP 部署行为完全不变。
+* 启用后 HTTPS 是**独立监听**（默认 443），不会把现有 80 / 8765 的 HTTP 改协议；
+  SNI 命中 ``certs/domains/<域名>/`` 时自动选用该域名的证书链。
 * 证书文件权限 0600（私钥）；CA 证书公开可下载，供客户端信任 / 指纹固定。
 * 自签 CA 与服务器证书分开：CA 只负责签发，服务器证书带 SAN（域名 + IP），
   避免浏览器 "net::ERR_CERT_COMMON_NAME_INVALID"。
@@ -42,6 +44,7 @@ DEFAULT_CERT_CN = "mDNS Studio"
 @dataclass
 class TLSConfig:
     enabled: bool = False
+    port: int = 443                     # 独立 HTTPS 网关端口；不影响 80 / 8765 的 HTTP
     cert_file: str = "certs/server.crt"
     key_file: str = "certs/server.key"
     ca_file: str = "certs/ca.crt"
@@ -68,6 +71,8 @@ class TLSConfig:
             raise ValueError("tls.ca_days / tls.cert_days 必须 > 0")
         if self.cert_days > self.ca_days:
             raise ValueError("tls.cert_days 不能大于 tls.ca_days（服务器证书不得超出 CA 有效期）")
+        if not isinstance(self.port, int) or isinstance(self.port, bool) or not 1 <= self.port <= 65535:
+            raise ValueError(f"tls.port 必须在 1..65535，实际为 {self.port!r}")
 
 
 def openssl_available() -> bool:
@@ -271,6 +276,50 @@ def make_ssl_context(cfg: TLSConfig, base_dir: str,
     return ctx
 
 
+def make_gateway_ssl_context(cfg: TLSConfig, base_dir: str) -> ssl.SSLContext:
+    """独立 HTTPS 网关上下文：SNI 命中已签发域名时自动换用该域名证书链。
+
+    浏览器在 TLS 握手时发送 SNI；回调把 socket 的 context 换成对应域名的
+    ``fullchain.pem + server.key``。未签发的域名保留默认 ``cert_file``，
+    因此不影响只访问 ``mdns.local`` 的最简场景。
+    """
+    ctx = make_ssl_context(cfg, base_dir)
+    cache: dict[str, ssl.SSLContext] = {}
+
+    def _base_settings(target: ssl.SSLContext) -> None:
+        target.minimum_version = ctx.minimum_version
+        target.maximum_version = ctx.maximum_version
+        target.options = ctx.options
+        if ctx.verify_mode != ssl.CERT_NONE:
+            ca = resolve_path(cfg.ca_file, base_dir)
+            if ca and os.path.isfile(ca):
+                target.load_verify_locations(cafile=ca)
+                target.verify_mode = ctx.verify_mode
+                target.verify_flags = ctx.verify_flags
+
+    def _select(sslsock, server_name: str | None, _original_ctx) -> None:
+        name = (server_name or "").strip().rstrip(".").lower()
+        if not name:
+            return
+        candidate = cache.get(name)
+        if candidate is None:
+            cert, key, fullchain = domain_cert_paths(base_dir, name)
+            cert = fullchain if os.path.isfile(fullchain) else cert
+            if not (os.path.isfile(cert) and os.path.isfile(key)):
+                return
+            try:
+                candidate = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                _base_settings(candidate)
+                candidate.load_cert_chain(certfile=cert, keyfile=key)
+            except (OSError, ssl.SSLError, ValueError):
+                return
+            cache[name] = candidate
+        sslsock.context = candidate
+
+    ctx.set_servername_callback(_select)
+    return ctx
+
+
 def tls_status(cfg: TLSConfig, base_dir: str) -> dict:
     """供 GET /api/tls/status 使用；不暴露私钥内容。"""
     ca = resolve_path(cfg.ca_file, base_dir)
@@ -281,6 +330,7 @@ def tls_status(cfg: TLSConfig, base_dir: str) -> dict:
         "enabled": cfg.enabled,
         "openssl": openssl_available(),
         "configured": {
+            "port": cfg.port,
             "cert_file": cfg.cert_file, "key_file": cfg.key_file,
             "ca_file": cfg.ca_file, "min_version": cfg.min_version,
             "client_auth": cfg.client_auth,

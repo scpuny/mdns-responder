@@ -900,6 +900,7 @@ def tls_features() -> None:
     base = load_config(os.path.join(ROOT, "config.toml"))
     check(getattr(base, "tls", None) is not None and not base.tls.enabled,
           "模板 [tls] 段默认关闭，不影响现有 HTTP 部署")
+    check(base.tls.port == 443, "TLS 默认端口为 443（独立 HTTPS 监听）")
     check(mdns_tls.openssl_available(), "本机 openssl 可用（签发前置条件）")
 
     tmpdir = tempfile.mkdtemp(prefix="mdns-tls-test-")
@@ -970,6 +971,7 @@ name = "tls-test.local"
 ip = "127.0.0.1"
 [tls]
 enabled = true
+port = 18443
 cert_file = "{cert}"
 key_file = "{key}"
 ca_file = "{ca}"
@@ -983,9 +985,25 @@ service_host = "tls-test.local"
     secured = load_config(cfg_path)
     check(secured.tls.enabled and secured.tls.service_instance == "Secure Console",
           "[tls] 段解析进入 Config")
+    check(secured.tls.port == 18443, "tls.port 从配置解析，不写死 443")
     records, by_key = build_records(secured)
     check(any(r.name == "_https._tcp.local" and r.rtype == TYPE_PTR for r in records),
           "启用 TLS 后发布 _https._tcp.local 服务发现")
+    srv_records = [r for r in records if r.rtype == TYPE_SRV
+                   and "_https._tcp.local" in r.name]
+    check(bool(srv_records) and struct.unpack("!HHH", srv_records[0].rdata[:6])[2] == 18443,
+          "HTTPS SRV 端口跟随 tls.port")
+
+    # 端口冲突必须在加载阶段拒绝，避免启动后抢占 mDNS / 管理台端口
+    bad_path = os.path.join(tmpdir, "bad-port.toml")
+    with open(bad_path, "w", encoding="utf-8") as fh:
+        fh.write(tls_toml.replace("port = 18443", "port = 15354", 1))
+    try:
+        load_config(bad_path)
+        conflict_rejected = False
+    except Exception:
+        conflict_rejected = True
+    check(conflict_rejected, "tls.port 与 mDNS/管理台端口冲突时拒绝加载")
     txt_records = [r for r in records if r.rtype == TYPE_TXT
                    and "_https._tcp.local" in r.name]
     check(bool(txt_records) and any(b"ca_fp=sha256:" in b for b in
@@ -996,18 +1014,22 @@ service_host = "tls-test.local"
     # TOML 往返：表单保存不能丢 [tls]
     merged = merge_tls(tls_toml, {"enabled": False})
     dumped = dump_toml({"server": {}, "tls": merged, "hosts": [], "services": []})
-    check("[tls]" in dumped and 'ca_file = ' in dumped,
-          "dump_toml 保留 [tls] 段（表单保存不丢证书配置）")
+    check("[tls]" in dumped and 'ca_file = ' in dumped and 'port = 18443' in dumped,
+          "dump_toml 保留 [tls] 段与 tls.port（表单保存不丢证书配置）")
     reparsed = mdns_tls.TLSConfig(**{k: v for k, v in merged.items()
                                      if k in mdns_tls.TLSConfig.__dataclass_fields__})
-    check(reparsed.cert_file == cert and reparsed.ca_days == 730,
-          "TLS 配置 TOML 往返一致")
+    check(reparsed.cert_file == cert and reparsed.ca_days == 730
+          and reparsed.port == 18443,
+          "TLS 配置 TOML 往返一致（含端口）")
 
 
 def tls_domains_features() -> None:
     """多域名证书：域名推导 / 单域名签发 / SAN / 一键签发 / 证书链 / 下载路径。"""
     print("\n[12] 多域名独立证书")
     import tempfile
+    import ssl
+    import threading
+    import http.server
     import mdns_tls
     from mdns_responder import Responder
 
@@ -1041,6 +1063,7 @@ ca_days = 90
 cert_days = 30
 ''')
     r = Responder(cfg_path)
+    r.tls_generate({})  # CA + 默认服务器证书，供 SNI 回退
     listing = r.tls_domains()
     names = [x["domain"] for x in listing["domains"]]
     check("idgate.local" in names and "spider.local" in names,
@@ -1077,6 +1100,47 @@ cert_days = 30
     check(all(x["issued"] for x in listing2["domains"]),
           "签发后所有域名状态为已签发")
     check(listing2["ca_ready"], "CA 自动创建并就绪")
+
+    # SNI：同一 443 监听按握手域名自动选用对应域名的证书链
+    class _SniHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"SNI_OK"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    sni_httpd = http.server.HTTPServer(("127.0.0.1", 0), _SniHandler)
+    sni_ctx = mdns_tls.make_gateway_ssl_context(r.cfg.tls, d)
+    sni_httpd.socket = sni_ctx.wrap_socket(sni_httpd.socket, server_side=True)
+    threading.Thread(target=sni_httpd.serve_forever, daemon=True).start()
+    try:
+        trust = ssl.create_default_context(
+            cafile=os.path.join(d, "certs", "ca.crt"))
+        with socket.create_connection(sni_httpd.server_address, timeout=3) as raw:
+            with trust.wrap_socket(raw, server_hostname="idgate.local") as conn:
+                subject = dict(x[0] for x in conn.getpeercert()["subject"])
+                check(subject.get("commonName") == "idgate.local",
+                      "SNI=idgate.local 时返回该域名的独立证书")
+                conn.sendall(b"GET / HTTP/1.1\r\nHost: idgate.local\r\n"
+                             b"Connection: close\r\n\r\n")
+                body = b""
+                conn.settimeout(3)
+                try:
+                    while b"SNI_OK" not in body:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        body += chunk
+                except socket.timeout:
+                    pass
+                check(b"SNI_OK" in body, "SNI 切换证书后 HTTPS 请求仍正常响应")
+    finally:
+        sni_httpd.shutdown()
+        sni_httpd.server_close()
 
     # 通配符域名被拒绝
     try:
