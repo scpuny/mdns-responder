@@ -44,6 +44,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import ssl
 import threading
 import time
 import tomllib
@@ -247,6 +248,28 @@ SERVER_FIELDS = (
 )
 
 
+TLS_FIELDS = (
+    ("enabled", bool), ("cert_file", str), ("key_file", str),
+    ("ca_file", str), ("ca_key_file", str), ("min_version", str),
+    ("client_auth", str), ("redirect_http", bool), ("publish_service", bool),
+    ("service_instance", str), ("service_host", str),
+    ("ca_days", int), ("cert_days", int),
+)
+
+
+def merge_tls(raw_text: str, submitted: dict | None) -> dict | None:
+    """保留原 [tls] 段中表单未提交的键；无 tls 段且未提交时返回 None。"""
+    try:
+        existing = tomllib.loads(raw_text).get("tls", {}) or {}
+    except (tomllib.TOMLDecodeError, AttributeError):
+        existing = {}
+    if not existing and not submitted:
+        return None
+    merged = dict(existing)
+    merged.update(submitted or {})
+    return merged
+
+
 def _normalize_gateway_field(key: str, value):
     """管理台表单的空值不该变成 0，否则开启网关时必然校验失败。
 
@@ -294,6 +317,20 @@ def dump_toml(config: dict) -> str:
             lines.append(f"{key} = {json.dumps(items, ensure_ascii=False)}")
         else:
             lines.append(f"{key} = {_toml_str(value)}")
+
+    tls = config.get("tls")
+    if tls:
+        lines += ["", "[tls]"]
+        for key, cast in TLS_FIELDS:
+            if key not in tls or tls[key] is None:
+                continue
+            value = tls[key]
+            if cast is bool:
+                lines.append(f"{key} = {'true' if value else 'false'}")
+            elif cast is int:
+                lines.append(f"{key} = {int(value)}")
+            else:
+                lines.append(f"{key} = {_toml_str(value)}")
 
     for host in config.get("hosts", []) or []:
         lines += ["", "[[hosts]]",
@@ -774,6 +811,29 @@ class AdminHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _serve_ca_pem(self) -> None:
+        """公开提供 CA 证书 PEM（公钥证书，非私钥）。"""
+        from mdns_tls import resolve_path
+        cfg = self.server.responder.cfg
+        tls_cfg = getattr(cfg, "tls", None)
+        path = (resolve_path(tls_cfg.ca_file, os.path.dirname(cfg.path))
+                if tls_cfg is not None else "")
+        if not path or not os.path.isfile(path):
+            return self._friendly("notfound", domain="CA 证书",
+                                  detail="尚未生成 CA 证书，请先在控制台生成")
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read()
+        except OSError as exc:
+            return self._friendly("unreachable", domain="CA 证书", detail=_short_exc(exc))
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-pem-file; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="mdns-studio-ca.crt"')
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -781,6 +841,9 @@ class AdminHandler(BaseHTTPRequestHandler):
             return self._page()
         if path.startswith("/go/"):
             return self._gateway(parsed)
+        # CA 证书公开下载：供客户端安装信任 / 做指纹固定，不需要管理 token。
+        if path in ("/api/tls/ca.pem", "/ca.pem"):
+            return self._serve_ca_pem()
         if not self._authorized():
             return self._json({"error": "unauthorized", "hint": "需要 X-Admin-Token"}, 401)
 
@@ -816,6 +879,15 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return self._json(responder.config_history())
             if path == "/api/alerts":
                 return self._json(responder.alerts_state())
+            if path == "/api/tls/status":
+                from mdns_tls import tls_status
+                cfg = responder.cfg
+                tls_cfg = getattr(cfg, "tls", None)
+                if tls_cfg is None:
+                    return self._json({"enabled": False, "openssl": False,
+                                       "files": {}, "certificate": {"available": False},
+                                       "ca": {"available": False}, "ready": False})
+                return self._json(tls_status(tls_cfg, os.path.dirname(cfg.path)))
             # 未知路径：给友好 404 页，而不是让人头大的报错栈
             return self._friendly("notfound", domain=path,
                                  detail="管理控制台没有这个地址")
@@ -862,6 +934,10 @@ class AdminHandler(BaseHTTPRequestHandler):
             if path == "/api/probe":
                 return self._json(responder.probe_once(payload.get("name", ""),
                                                        payload.get("type", "ANY")))
+            if path == "/api/tls/generate":
+                if not self._require_admin():
+                    return None
+                return self._json(responder.tls_generate(payload))
             return self._json({"error": "not found", "path": path}, 404)
         except ValueError as exc:
             return self._json({"error": str(exc)}, 400)
@@ -976,11 +1052,21 @@ def start_gateway(responder, log_handler: RingLogHandler | None = None):
     except OSError as exc:
         LOG.warning("HTTP 网关启动失败（不影响 mDNS 服务）: %s", exc)
         return None
+    scheme = "http"
+    tls_cfg = getattr(responder.cfg, "tls", None)
+    if tls_cfg is not None and tls_cfg.enabled:
+        from mdns_tls import make_ssl_context
+        try:
+            ctx = make_ssl_context(tls_cfg, os.path.dirname(responder.config_path))
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+            scheme = "https"
+        except (OSError, ssl.SSLError, ValueError) as exc:
+            LOG.error("HTTP 网关 HTTPS 启用失败，降级为 HTTP: %s", exc)
     thread = threading.Thread(target=httpd.serve_forever, name="mdns-gateway", daemon=True)
     thread.start()
     admin_hint = server_cfg.gateway_admin_host or "(本机 IP 或 /admin)"
-    LOG.info("HTTP 网关已启动: http://0.0.0.0:%d/  (管理台域名=%s)",
-             server_cfg.gateway_port, admin_hint)
+    LOG.info("HTTP 网关已启动: %s://0.0.0.0:%d/  (管理台域名=%s)",
+             scheme, server_cfg.gateway_port, admin_hint)
     return httpd
 
 
@@ -998,10 +1084,21 @@ def start_admin(responder, log_handler: RingLogHandler | None = None):
     except OSError as exc:
         LOG.warning("管理界面启动失败（不影响 mDNS 服务）: %s", exc)
         return None
+    scheme = "http"
+    tls_cfg = getattr(responder.cfg, "tls", None)
+    if tls_cfg is not None and tls_cfg.enabled:
+        from mdns_tls import make_ssl_context
+        try:
+            ctx = make_ssl_context(tls_cfg, os.path.dirname(responder.config_path))
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+            scheme = "https"
+            responder.tls_active = True
+        except (OSError, ssl.SSLError, ValueError) as exc:
+            LOG.error("管理界面 HTTPS 启用失败，降级为 HTTP（不影响 mDNS 服务）: %s", exc)
     thread = threading.Thread(target=httpd.serve_forever, name="mdns-admin", daemon=True)
     thread.start()
     host = server_cfg.management_host
-    LOG.info("管理界面已启动: http://%s:%d/", host, server_cfg.management_port)
+    LOG.info("管理界面已启动: %s://%s:%d/", scheme, host, server_cfg.management_port)
     return httpd
 
 

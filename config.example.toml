@@ -51,6 +51,25 @@ gateway_port = 80
 gateway_admin_host = "mdns.local"   # 访问该域名即进控制台；也可直接用 http://<盒子IP>/ 或 /admin
 gateway_timeout = 6.0               # 反代到后端的连接超时（秒）
 
+# ---- HTTPS 管理台 + 自签 CA（默认关闭）----
+# 运行期 TLS 用 Python 标准库 ssl；证书签发调用系统 openssl（容器镜像已自带）。
+# 路径相对本配置文件所在目录。启用后管理台与网关均改用 TLS；需重启进程生效。
+# 不启用时下方所有字段都不生效，现有 HTTP 部署行为完全不变。
+[tls]
+enabled = false
+cert_file = "certs/server.crt"       # 服务器证书（含 SAN：localhost + 域名 + IP）
+key_file = "certs/server.key"        # 服务器私钥，自动生成时权限 0600
+ca_file = "certs/ca.crt"             # 自签 CA 证书，可浏览器中安装信任
+ca_key_file = "certs/ca.key"         # CA 私钥，仅签发时用，权限 0600
+min_version = "TLSv1.2"              # TLSv1.2 / TLSv1.3
+client_auth = "none"                 # none / optional / require（双向认证）
+redirect_http = false                # 预留
+publish_service = true               # 发布 _https._tcp.local，TXT 携带 CA 指纹
+service_instance = "mDNS Studio"     # mDNS 服务实例名（含空格需引号）
+service_host = ""                    # 服务绑定域名，空则复用 gateway_admin_host
+ca_days = 730                        # CA 有效期（天）
+cert_days = 365                      # 服务器证书有效期（天，不能超过 CA）
+
 # ---- 有界文件日志（防止长期运行撑爆磁盘）----
 # log_file 相对项目根目录；留空 "" 则完全不写文件（仅控制台 + 管理页面 SSE 日志）
 # 轮转策略：单文件达到 log_max_bytes 即归档为 .1/.2...，最多保留

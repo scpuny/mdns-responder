@@ -888,6 +888,132 @@ def platform_features() -> None:
     check(metrics.endswith("\n"), "指标以换行结束")
 
 
+def tls_features() -> None:
+    """HTTPS / CA 离线测试：配置默认、签发、TLS 握手、mDNS 发现、TOML 往返。"""
+    print("\n[11] HTTPS 与自签 CA")
+    import ssl
+    import threading
+    import http.server
+    import mdns_tls
+    from admin_server import dump_toml, merge_tls
+
+    base = load_config(os.path.join(ROOT, "config.toml"))
+    check(getattr(base, "tls", None) is not None and not base.tls.enabled,
+          "模板 [tls] 段默认关闭，不影响现有 HTTP 部署")
+    check(mdns_tls.openssl_available(), "本机 openssl 可用（签发前置条件）")
+
+    tmpdir = tempfile.mkdtemp(prefix="mdns-tls-test-")
+    ca = os.path.join(tmpdir, "ca.crt")
+    ca_key = os.path.join(tmpdir, "ca.key")
+    cert = os.path.join(tmpdir, "server.crt")
+    key = os.path.join(tmpdir, "server.key")
+
+    ca_info = mdns_tls.generate_ca(ca, ca_key, cn="Selftest CA", days=10)
+    check(len(ca_info.get("fingerprint", "")) == 64, "CA 指纹为 SHA-256 64 hex")
+    check("Selftest CA" in ca_info.get("subject", ""), "CA 主体 CN 正确")
+    check(oct(os.stat(ca_key).st_mode & 0o777) == "0o600", "CA 私钥权限 0600")
+
+    cert_info_result = mdns_tls.generate_server_cert(
+        cert, key, ca, ca_key, common_name="Selftest Server",
+        names=["mdns.local", "127.0.0.1"], days=5)
+    check("DNS:mdns.local" in cert_info_result.get("san", "")
+          and "127.0.0.1" in cert_info_result.get("san", ""),
+          "服务器证书 SAN 含域名与 IP")
+    check(oct(os.stat(key).st_mode & 0o777) == "0o600", "服务器私钥权限 0600")
+
+    # 真实 TLS 握手（自签 CA 信任链 + 自定义 context）
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"TLS_OK"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    cfg = mdns_tls.TLSConfig(cert_file=cert, key_file=key)
+    ctx = mdns_tls.make_ssl_context(cfg, tmpdir)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        client_ctx = ssl.create_default_context(cafile=ca)
+        with socket.create_connection(httpd.server_address, timeout=3) as raw:
+            with client_ctx.wrap_socket(raw, server_hostname="localhost") as conn:
+                conn.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n"
+                             b"Connection: close\r\n\r\n")
+                data = b""
+                conn.settimeout(3)
+                try:
+                    while b"TLS_OK" not in data:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                except socket.timeout:
+                    pass
+                check(b"TLS_OK" in data, "HTTPS 握手成功并返回响应")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    # 配置解析 + mDNS _https._tcp.local 服务发现
+    tls_toml = f"""
+[server]
+interface = "0.0.0.0"
+port = 15354
+management_port = 18765
+[[hosts]]
+name = "tls-test.local"
+ip = "127.0.0.1"
+[tls]
+enabled = true
+cert_file = "{cert}"
+key_file = "{key}"
+ca_file = "{ca}"
+ca_key_file = "{ca_key}"
+service_instance = "Secure Console"
+service_host = "tls-test.local"
+"""
+    cfg_path = os.path.join(tmpdir, "config.toml")
+    with open(cfg_path, "w", encoding="utf-8") as fh:
+        fh.write(tls_toml)
+    secured = load_config(cfg_path)
+    check(secured.tls.enabled and secured.tls.service_instance == "Secure Console",
+          "[tls] 段解析进入 Config")
+    records, by_key = build_records(secured)
+    check(any(r.name == "_https._tcp.local" and r.rtype == TYPE_PTR for r in records),
+          "启用 TLS 后发布 _https._tcp.local 服务发现")
+    txt_records = [r for r in records if r.rtype == TYPE_TXT
+                   and "_https._tcp.local" in r.name]
+    check(bool(txt_records) and any(b"ca_fp=sha256:" in b for b in
+          [txt_records[0].rdata[i + 1:i + 1 + txt_records[0].rdata[i]]
+           for i in _txt_offsets(txt_records[0].rdata)]),
+          "HTTPS 服务 TXT 携带 CA 指纹供客户端固定")
+
+    # TOML 往返：表单保存不能丢 [tls]
+    merged = merge_tls(tls_toml, {"enabled": False})
+    dumped = dump_toml({"server": {}, "tls": merged, "hosts": [], "services": []})
+    check("[tls]" in dumped and 'ca_file = ' in dumped,
+          "dump_toml 保留 [tls] 段（表单保存不丢证书配置）")
+    reparsed = mdns_tls.TLSConfig(**{k: v for k, v in merged.items()
+                                     if k in mdns_tls.TLSConfig.__dataclass_fields__})
+    check(reparsed.cert_file == cert and reparsed.ca_days == 730,
+          "TLS 配置 TOML 往返一致")
+
+
+def _txt_offsets(rdata: bytes) -> list[int]:
+    offsets: list[int] = []
+    i = 0
+    while i < len(rdata):
+        n = rdata[i]
+        offsets.append(i)
+        i += 1 + n
+    return offsets
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--offline", action="store_true", help="仅运行离线报文测试")
@@ -899,6 +1025,7 @@ def main() -> int:
     platform_features()
     log_rotation()
     friendly_page()
+    tls_features()
     if not args.offline:
         e2e()
         verify_admin_api()

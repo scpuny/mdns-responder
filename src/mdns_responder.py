@@ -34,6 +34,7 @@ import argparse
 import ipaddress
 import logging
 import os
+import re
 import select
 import shutil
 import signal
@@ -428,6 +429,7 @@ class Config:
     services: list[ServiceEntry]
     path: str
     mtime_ns: int
+    tls: "TLSConfig | None" = None       # [tls] 段；None = 未配置（等价默认关闭）
 
 
 def _as_str(value: object, field_name: str) -> str:
@@ -600,10 +602,37 @@ def load_config(path: str) -> Config:
         proxy = _as_bool(item.get("proxy", True), f"services[{idx}].proxy")
         services.append(ServiceEntry(svc_type, instance, ip, port, host, txt, proxy))
 
+    # [tls] 段：HTTPS 管理台 + 自签 CA。独立于 [server]，默认关闭。
+    from mdns_tls import TLSConfig
+    tls_raw = raw.get("tls", {}) or {}
+    if not isinstance(tls_raw, dict):
+        raise ConfigError("tls 必须是表")
+    tls = TLSConfig(
+        enabled=_as_bool(tls_raw.get("enabled", False), "tls.enabled"),
+        cert_file=_as_str(tls_raw.get("cert_file", "certs/server.crt"), "tls.cert_file"),
+        key_file=_as_str(tls_raw.get("key_file", "certs/server.key"), "tls.key_file"),
+        ca_file=_as_str(tls_raw.get("ca_file", "certs/ca.crt"), "tls.ca_file"),
+        ca_key_file=_as_str(tls_raw.get("ca_key_file", "certs/ca.key"), "tls.ca_key_file"),
+        min_version=_as_str(tls_raw.get("min_version", "TLSv1.2"), "tls.min_version"),
+        client_auth=_as_str(tls_raw.get("client_auth", "none"), "tls.client_auth"),
+        redirect_http=_as_bool(tls_raw.get("redirect_http", False), "tls.redirect_http"),
+        publish_service=_as_bool(tls_raw.get("publish_service", True), "tls.publish_service"),
+        service_instance=_as_str(tls_raw.get("service_instance", "mDNS Studio"),
+                                 "tls.service_instance"),
+        service_host=_as_str(tls_raw.get("service_host", ""), "tls.service_host"),
+        ca_days=_as_int(tls_raw.get("ca_days", 730), "tls.ca_days"),
+        cert_days=_as_int(tls_raw.get("cert_days", 365), "tls.cert_days"),
+    )
+    try:
+        tls.validate()
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
     if not hosts and not services:
         raise ConfigError("配置中没有任何 hosts 或 services，服务不会发布任何记录")
 
-    return Config(server, hosts, services, os.path.abspath(path), os.stat(path).st_mtime_ns)
+    return Config(server, hosts, services, os.path.abspath(path),
+                  os.stat(path).st_mtime_ns, tls=tls)
 
 
 def _slug(instance: str) -> str:
@@ -716,6 +745,66 @@ def build_records(cfg: Config) -> tuple[list[Record], dict[str, Record]]:
         all_service_keys.extend((ptr_key, srv_key, txt_key, a_key))
         if svc.type.lower() not in [t.lower() for t in service_types]:
             service_types.append(svc.type)
+
+    # HTTPS 管理台服务发现：_https._tcp.local，TXT 携带 CA 指纹供客户端固定信任。
+    # 仅当 [tls] enabled + publish_service 时发布；解析证书失败不阻断 mDNS 主服务。
+    tls_cfg = getattr(cfg, "tls", None)
+    if tls_cfg is not None and tls_cfg.enabled and tls_cfg.publish_service:
+        from mdns_tls import cert_fingerprint, resolve_path
+        base_dir = os.path.dirname(cfg.path)
+        ca_path = resolve_path(tls_cfg.ca_file, base_dir)
+        fp = cert_fingerprint(ca_path)
+        host_name = (tls_cfg.service_host or cfg.server.gateway_admin_host
+                     or f"{_slug(tls_cfg.service_instance)}.local").rstrip(".").lower()
+        # 域名已在 [[hosts]] 中登记时复用其 IP，避免同一域名映射到两个地址而冲突。
+        mapped = next((h for h in cfg.hosts if h.name.lower() == host_name), None)
+        ip = mapped.ip if mapped else None
+        if not ip:
+            for _candidate in _local_ipv4_interfaces():
+                if not _candidate.startswith("127."):
+                    ip = _candidate
+                    break
+        if ip:
+            a_key = make_address(host_name, ip)
+            instance = tls_cfg.service_instance.strip() or "mDNS Studio"
+            svc_type = "_https._tcp.local"
+            instance_fqdn = f"{instance}.{svc_type}"
+            txt: dict[str, str] = {
+                "tls": "1",
+                "version": tls_cfg.min_version,
+                "path": "/",
+                "ca_fp": f"sha256:{fp}" if fp else "unavailable",
+            }
+            if tls_cfg.client_auth == "require":
+                txt["client_auth"] = "required"
+            txt_rdata = b"".join(
+                bytes([len(b)]) + b
+                for b in sorted(_txt_bytes(f"{k}={v}") for k, v in txt.items())
+            )
+            srv_rdata = struct.pack("!HHH", 0, 0, cfg.server.management_port) + encode_name(host_name)
+            srv_key = f"srv:{instance_fqdn.lower()}"
+            txt_key = f"txt:{instance_fqdn.lower()}"
+            ptr_key = f"ptr:{svc_type.lower()}:{instance_fqdn.lower()}"
+            add(Record(
+                key=srv_key, name=instance_fqdn, rtype=TYPE_SRV, rdata=srv_rdata,
+                ttl=ttl, flush=True, extras=(a_key, txt_key),
+                display=f"SRV  {instance_fqdn}. -> 0 0 {cfg.server.management_port} {host_name}.",
+            ))
+            add(Record(
+                key=txt_key, name=instance_fqdn, rtype=TYPE_TXT, rdata=txt_rdata,
+                ttl=ttl, flush=True, extras=(srv_key, a_key),
+                display=(f"TXT  {instance_fqdn}. -> "
+                         f"{[s.decode('utf-8', 'replace') for s in _txt_strings(txt_rdata)]}"),
+            ))
+            add(Record(
+                key=ptr_key, name=svc_type, rtype=TYPE_PTR,
+                rdata=encode_name(instance_fqdn), ttl=ttl, flush=False,
+                extras=(srv_key, txt_key, a_key),
+                display=f"PTR  {svc_type}. -> {instance_fqdn}.",
+            ))
+            all_service_keys.extend((ptr_key, srv_key, txt_key, a_key))
+            if svc_type.lower() not in [t.lower() for t in service_types]:
+                service_types.append(svc_type)
 
     # 服务类型枚举：_services._dns-sd._udp.local -> 每个服务类型一条 PTR
     for svc_type in service_types:
@@ -967,6 +1056,8 @@ class MdnsSocket:
 # Responder 主体
 # ---------------------------------------------------------------------------
 class Responder:
+    tls_active: bool = False             # 管理台是否真正以 HTTPS 启动成功
+
     def __init__(self, config_path: str, verbose: bool = False,
                  disable_admin: bool = False):
         self.config_path = os.path.abspath(config_path)
@@ -1089,7 +1180,8 @@ class Responder:
             "reverse_ptr": srv.reverse_ptr,
             "management": {
                 "enabled": srv.management,
-                "url": f"http://{srv.management_host}:{srv.management_port}/",
+                "url": f"{'https' if getattr(self, 'tls_active', False) else 'http'}://"
+                       f"{srv.management_host}:{srv.management_port}/",
                 "auth_required": bool(srv.management_token),
             },
             "logging": {
@@ -1194,6 +1286,54 @@ class Responder:
             "extras": len(rec.extras),
         } for rec in self.records]
 
+    def tls_generate(self, payload: dict) -> dict:
+        """生成自签 CA + 服务器证书（写操作；由 API 层校验管理员密码）。
+
+        签发需要系统 openssl；失败时返回明确错误，不改动任何文件状态。
+        成功后需重启服务（或 SIGHUP 不重建 socket）才能让 HTTPS 监听生效。
+        """
+        from mdns_tls import (generate_ca, generate_server_cert, openssl_available,
+                              resolve_path, tls_status)
+        if not openssl_available():
+            raise RuntimeError("未找到 openssl，无法签发证书；请安装后重试或导入已有 PEM")
+        tls_cfg = getattr(self.cfg, "tls", None)
+        if tls_cfg is None:
+            raise RuntimeError("配置中缺少 [tls] 段")
+        base = os.path.dirname(self.config_path)
+        ca_cert = resolve_path(tls_cfg.ca_file, base)
+        ca_key = resolve_path(tls_cfg.ca_key_file, base)
+        cert = resolve_path(tls_cfg.cert_file, base)
+        key = resolve_path(tls_cfg.key_file, base)
+        for path in (ca_cert, ca_key, cert, key):
+            if not path:
+                raise RuntimeError("证书路径不能为空，请先在 [tls] 段配置")
+        ca_cn = str(payload.get("ca_cn", "") or "mDNS Studio Local CA").strip()
+        server_cn = str(payload.get("server_cn", "") or "mDNS Studio").strip()
+        names: list[str] = []
+        raw_names = payload.get("names")
+        if isinstance(raw_names, str):
+            names = [x.strip() for x in re.split(r"[,\s]+", raw_names) if x.strip()]
+        elif isinstance(raw_names, list):
+            names = [str(x).strip() for x in raw_names if str(x).strip()]
+        if not names:
+            names = ["localhost", "mdns.local"] + [
+                ip for ip in _local_ipv4_interfaces() if not ip.startswith("127.")]
+        days = max(1, int(payload.get("days", tls_cfg.cert_days)))
+        ca_days = max(days, int(payload.get("ca_days", tls_cfg.ca_days)))
+        ca_info = generate_ca(ca_cert, ca_key, cn=ca_cn, days=ca_days)
+        cert_info_result = generate_server_cert(
+            cert, key, ca_cert, ca_key, common_name=server_cn,
+            names=names, days=days)
+        LOG.info("TLS 证书已生成: CA=%s, server=%s；重启服务后 HTTPS 生效", ca_cert, cert)
+        return {
+            "ok": True,
+            "message": "证书已生成，重启服务后 HTTPS 生效",
+            "ca": ca_info,
+            "certificate": cert_info_result,
+            "names": names,
+            "status": tls_status(tls_cfg, base),
+        }
+
     def config_json(self) -> dict:
         with open(self.config_path, "r", encoding="utf-8") as fh:
             raw = fh.read()
@@ -1231,6 +1371,16 @@ class Responder:
                     "alert_webhooks": list(srv.alert_webhooks),
                     "history_limit": srv.history_limit,
                 },
+                "tls": ({
+                    "enabled": t.enabled, "cert_file": t.cert_file,
+                    "key_file": t.key_file, "ca_file": t.ca_file,
+                    "ca_key_file": t.ca_key_file, "min_version": t.min_version,
+                    "client_auth": t.client_auth, "redirect_http": t.redirect_http,
+                    "publish_service": t.publish_service,
+                    "service_instance": t.service_instance,
+                    "service_host": t.service_host,
+                    "ca_days": t.ca_days, "cert_days": t.cert_days,
+                } if (t := getattr(self.cfg, "tls", None)) is not None else {}),
                 "hosts": [{"name": h.name, "ip": h.ip} for h in self.cfg.hosts],
                 "services": [{
                     "type": s.type, "instance": s.instance, "host": s.host or "",
@@ -1243,7 +1393,7 @@ class Responder:
 
     def save_config(self, payload: dict) -> dict:
         """校验 -> 备份 -> 原子替换 -> 标记热重载。任何校验失败都不改动原文件。"""
-        from admin_server import dump_toml, merge_server
+        from admin_server import dump_toml, merge_server, merge_tls
 
         if isinstance(payload.get("raw"), str):
             text = payload["raw"]
@@ -1252,6 +1402,9 @@ class Responder:
                 current_raw = fh.read()
             cfg = dict(payload["config"])
             cfg["server"] = merge_server(current_raw, cfg.get("server", {}))
+            tls_section = merge_tls(current_raw, cfg.get("tls"))
+            if tls_section is not None:
+                cfg["tls"] = tls_section
             text = dump_toml(cfg)
         else:
             raise ConfigError("请求体需包含 raw 或 config")

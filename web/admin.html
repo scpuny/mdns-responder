@@ -458,7 +458,7 @@ const S = {
   demo:false, tab:'overview', theme:localStorage.getItem('mdns.theme')||'auto',
   token:localStorage.getItem('mdns.token')||'', status:null, config:null,
   adminPw:sessionStorage.getItem('mdns.adminpw')||'',
-  auth:null, history:null, alerts:null,
+  auth:null, history:null, alerts:null, tls:null,
   ifaceOptions:[], records:[], logs:[], probe:null,
   probeName:'_services._dns-sd._udp.local', probeType:'PTR', dirty:false, configMode:'form', configSubTab:'basic',
   typeFilter:'ALL', recordSearch:'', logLevel:'ALL', autoScroll:true, es:null,
@@ -598,7 +598,7 @@ function loadDemo(){
 }
 async function refreshAll(){
   const st=await api('/api/status');S.status=st;
-  const [cfg,rec,logs,ifaces,health,queries,browse,conflicts,auth,hist,alerts]=await Promise.all([
+  const [cfg,rec,logs,ifaces,health,queries,browse,conflicts,auth,hist,alerts,tlsStatus]=await Promise.all([
     api('/api/config'),api('/api/records'),api('/api/logs?limit=300'),api('/api/interfaces'),
     api('/api/health').catch(function(){return {enabled:false,items:[]};}),
     api('/api/queries?limit=100').catch(function(){return {enabled:false,items:[],total:0};}),
@@ -606,7 +606,9 @@ async function refreshAll(){
     api('/api/conflicts').catch(function(){return {enabled:false,items:[],count:0};}),
     api('/api/auth').catch(function(){return {enabled:false};}),
     api('/api/config/history').catch(function(){return {enabled:false,items:[],count:0,limit:30};}),
-    api('/api/alerts').catch(function(){return {enabled:false,webhooks:0,stats:{sent:0,failed:0}};})]);
+    api('/api/alerts').catch(function(){return {enabled:false,webhooks:0,stats:{sent:0,failed:0}};}),
+    api('/api/tls/status').catch(function(){return {enabled:false,files:{},certificate:{},ca:{}};})]);
+  S.tls=tlsStatus;
   S.config=cfg;S.records=rec.items||[];S.logs=logs.items||[];
   S.ifaceOptions=(ifaces.items||[]).slice();
   S.health=health;S.queries=queries;S.browse=browse;S.conflicts=conflicts;
@@ -851,6 +853,7 @@ const CONFIG_SUBTABS=[
   {id:'gateway',  label:'HTTP 网关',  icon:'link'},
   {id:'insights', label:'可观测',     icon:'activity'},
   {id:'security', label:'安全设置',   icon:'lock'},
+  {id:'tls',      label:'HTTPS / CA', icon:'lock'},
   {id:'history',  label:'版本历史',   icon:'history'},
   {id:'alerts',   label:'告警通知',   icon:'bell'},
   {id:'raw',      label:'TOML 源码',  icon:'terminal'}
@@ -961,6 +964,54 @@ function configExtras(){
     alerts:   card('告警通知','健康翻转与名称冲突推送到群机器人',alertBody,'s12','d1')
   };
 }
+function tlsField(k,label,v,hint){
+  return '<div class="field"><label>'+esc(label)+(hint?' <span style="color:var(--ink-3);text-transform:none;letter-spacing:0">'+esc(hint)+'</span>':'')+'</label>'+
+    '<input class="inp mono" data-tls="'+k+'" type="text" value="'+esc(v==null?'':v)+'"></div>';
+}
+function tlsSwitch(k,label,checked,hint){
+  return '<div class="switch-row"><div><div style="font-size:12.5px;font-weight:650">'+esc(label)+'</div>'+
+    (hint?'<div style="font-size:11px;color:var(--ink-3)">'+esc(hint)+'</div>':'')+'</div>'+
+    '<button type="button" class="switch'+(checked?' on':'')+'" data-act="tls-toggle" data-key="'+k+'"></button></div>';
+}
+function viewTls(){
+  const c=(S.config&&S.config.config)||{},t=c.tls||{},st=S.tls||{};
+  const cert=st.certificate||{},ca=st.ca||{};
+  const badge=function(ok,yes,no){return '<span class="badge '+(ok?'b-SRV':'b-OTHER')+'">'+(ok?yes:no)+'</span>';};
+  const form='<div class="form-grid">'+
+    tlsField('cert_file','服务器证书 PEM',t.cert_file||'certs/server.crt')+
+    tlsField('key_file','服务器私钥 PEM',t.key_file||'certs/server.key')+
+    tlsField('ca_file','CA 证书 PEM',t.ca_file||'certs/ca.crt')+
+    tlsField('ca_key_file','CA 私钥 PEM',t.ca_key_file||'certs/ca.key')+
+    tlsField('service_instance','mDNS 服务实例名',t.service_instance||'mDNS Studio')+
+    tlsField('service_host','服务绑定域名',t.service_host||'','默认复用网关域名')+
+    '</div><div class="form-grid" style="margin-top:12px">'+
+    tlsField('min_version','最低 TLS 版本',t.min_version||'TLSv1.2','TLSv1.2 / TLSv1.3')+
+    tlsField('client_auth','客户端证书校验',t.client_auth||'none','none / optional / require')+
+    tlsField('ca_days','CA 有效期 (天)',t.ca_days||730)+
+    tlsField('cert_days','服务器证书有效期 (天)',t.cert_days||365)+
+    '</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 26px;margin-top:12px;border-top:1px solid var(--line-soft);padding-top:8px">'+
+    tlsSwitch('enabled','启用 HTTPS',!!t.enabled,'管理台与网关改用 TLS监听；文件缺失时自动降级 HTTP')+
+    tlsSwitch('publish_service','发布 HTTPS 服务发现',t.publish_service!==false,'广播 _https._tcp.local，TXT 携带 CA 指纹')+
+    '</div>';
+  const statusBody='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px">'+
+    '<div>'+badge(!!st.ready,'HTTPS 就绪','未就绪')+'</div>'+
+    '<div>'+badge(!!st.openssl,'openssl 可用','缺少 openssl')+'</div>'+
+    '<div>'+badge(!!(st.files&&st.files.cert),'服务器证书','证书缺失')+'</div>'+
+    '<div>'+badge(!!(st.files&&st.files.ca),'CA 证书','CA 缺失')+'</div></div>'+
+    '<div class="mono" style="font-size:11px;line-height:1.85;color:var(--ink-2);word-break:break-all">'+
+    '<div>CA 主体：'+esc(ca.subject||'—')+'</div>'+
+    '<div>CA 指纹：'+esc(ca.fingerprint||'—')+'</div>'+
+    '<div>证书主体：'+esc(cert.subject||'—')+'</div>'+
+    '<div>有效期：'+esc(cert.not_before||'—')+' → '+esc(cert.not_after||'—')+'</div>'+
+    '<div>SAN：'+esc(cert.san||'—')+'</div></div>'+
+    '<div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:16px">'+
+    '<button class="btn ghost" data-act="tls-generate">'+icon('refresh',14)+' 生成自签 CA + 服务器证书</button>'+
+    '<a class="btn ghost" href="/api/tls/ca.pem" target="_blank" download="mdns-studio-ca.crt">'+icon('download',14)+' 下载 CA 证书</a></div>'+
+    '<div style="margin-top:14px;padding:14px 16px;border-radius:14px;background:var(--bg-soft);border:1px solid var(--line-soft);font-size:11.5px;color:var(--ink-3);line-height:1.8">'+
+    '签发使用系统 openssl（标准库仅负责 TLS 运行期）。启用 HTTPS 后需<b>重启进程</b>才会切换监听协议；热重载只更新配置与 mDNS 记录。客户端安装 CA 后即可信任本地证书，也可用 TXT 中的 <span class="mono">ca_fp</span> 做指纹固定。</div>';
+  return card('HTTPS 与证书配置','证书路径相对配置文件目录；私钥权限自动设为 0600',form,'s12','d1')+
+         card('证书状态','当前证书链与 CA 指纹；签发/下载操作即时生效，启用开关需重启',statusBody,'s12','d2');
+}
 function viewConfig(){
   const c=(S.config&&S.config.config)||{server:{},hosts:[],services:[]};
   const srv=c.server||{};
@@ -1011,6 +1062,7 @@ function viewConfig(){
     gateway: card('HTTP 网关','按 Host 头把服务域名反代到目标 IP:端口，并把管理台收编进网关端口',gwForm,'s12','d1'),
     insights: card('可观测增强','健康探测 / 局域网地图 / 查询审计 / 名称冲突，均热重载即时生效',insightsGrid,'s12','d1'),
     security: ex.security,
+    tls: viewTls(),
     history: ex.history,
     alerts: ex.alerts,
     raw: card('TOML 源码','直接编辑原始配置；保存时会先做完整校验再原子替换',
@@ -1057,7 +1109,17 @@ function syncFromDom(){
     return {type:g('type'),instance:g('instance'),host:g('host'),ip:g('ip'),
             port:Number(g('port')||0),txt:strToTxt(g('txt')),proxy:proxy};
   }).filter(function(s){return s.type||s.instance||s.ip;});
-  S.config.config={server:server,hosts:hosts,services:services};
+  const tls={};
+  document.querySelectorAll('[data-tls]').forEach(function(el){
+    const k=el.dataset.tls,v=String(el.value||'').trim();
+    if(/^(ca_days|cert_days)$/.test(k))tls[k]=Number(v||0);
+    else tls[k]=v;
+  });
+  ['enabled','publish_service'].forEach(function(k){
+    const el=document.querySelector('.switch[data-act="tls-toggle"][data-key="'+k+'"]');
+    if(el)tls[k]=el.classList.contains('on');
+  });
+  S.config.config={server:server,hosts:hosts,services:services,tls:tls};
 }
 function markDirty(){S.dirty=true;const f=document.getElementById('dirtyFlag');if(f)f.classList.remove('hide');}
 
@@ -1391,6 +1453,16 @@ async function reloadService(){
   try{await api('/api/reload',{method:'POST',body:'{}'});toast('已触发配置重载','ok');setTimeout(refreshStatus,600);}
   catch(e){toast('重载失败：'+e.message,'err');}
 }
+async function generateTls(){
+  if(S.demo){toast('演示模式：不支持实际签发证书','info');return;}
+  if(!(await ensureAdminPassword()))return;
+  toast('正在生成自签 CA 与服务器证书…','info');
+  try{
+    const r=await api('/api/tls/generate',{method:'POST',body:JSON.stringify({})});
+    S.tls=r.status;renderTab();
+    toast(r.message+'（CA 指纹 '+String(r.ca&&r.ca.fingerprint||'').slice(0,12)+'…）','ok');
+  }catch(e){toast('证书生成失败：'+e.message,'err');}
+}
 async function runProbe(name,type){
   if(!name)return toast('请输入要查询的域名','err');
   S.probeName=name;S.probeType=type||'ANY';
@@ -1434,6 +1506,8 @@ document.addEventListener('click',function(e){
   else if(a==='token')askToken();
   else if(a==='config-subtab')setConfigSubTab(el.dataset.subtab);
   else if(a==='toggle'){el.classList.toggle('on');markDirty();}
+  else if(a==='tls-toggle'){el.classList.toggle('on');markDirty();}
+  else if(a==='tls-generate')generateTls();
   else if(a==='add-host')addRow('host');
   else if(a==='add-service')addRow('service');
   else if(a==='del-host')delRow('host',Number(el.dataset.idx));

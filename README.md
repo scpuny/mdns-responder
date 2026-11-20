@@ -57,6 +57,7 @@
 | **5353 共存** | `SO_REUSEADDR + SO_REUSEPORT`，与系统 avahi / Chrome / systemd-resolved 共存 |
 | **Web 控制台** | 在线改配置并即时生效、看记录 / 日志 / 探针，双主题玻璃拟态单文件 |
 | **可观测** | 健康状态灯 / 查询审计 / 局域网地图 / 名称冲突 / Prometheus 指标 |
+| **HTTPS / CA** | 标准库 TLS 服务端；自签 CA + 带 SAN 服务器证书；`_https._tcp.local` 服务发现携带 CA 指纹 |
 | **写操作保护** | 管理员密码（PBKDF2 加盐）保护配置保存、回滚、改密；只在当前标签页会话内缓存 |
 | **配置版本历史** | 每次保存 / 回滚前自动快照，可查看并一键回滚；有界保留、防路径穿越 |
 | **告警通知** | 健康状态翻转 / 名称冲突推送钉钉 / 飞书 / Slack / 企业微信 / 通用 Webhook |
@@ -237,6 +238,44 @@ txt      = { path = "/", version = "1.0" }
 
 ---
 
+## HTTPS 与自签 CA（可选，默认关闭）
+
+在 `[tls]` 段启用 HTTPS。运行期 TLS 完全由 Python 标准库 `ssl` 提供，无第三方 pip 依赖；
+证书签发调用系统 `openssl` CLI（Linux/macOS 与 `python:3.11-slim` 镜像均自带）。
+
+```toml
+[tls]
+enabled = true
+cert_file = "certs/server.crt"      # 服务器证书（含 SAN：域名 + IP）
+key_file  = "certs/server.key"      # 私钥，权限 0600
+ca_file   = "certs/ca.crt"          # 自签 CA 证书
+ca_key_file = "certs/ca.key"        # CA 私钥，权限 0600
+client_auth = "none"                # none / optional / require（双向认证）
+publish_service = true              # 发布 _https._tcp.local，TXT 携带 CA 指纹
+```
+
+三种启用方式：
+
+1. **控制台签发**（推荐）：配置管理 → 「HTTPS / CA」子标签 → 「生成自签 CA + 服务器证书」。
+   自动创建 CA + 带 SAN 的服务器证书，SAN 包含 `localhost`、`127.0.0.1`、
+   `gateway_admin_host` 及本机所有非回环 IPv4。
+2. **命令行签发**：`python3 -c "import sys; sys.path.insert(0,'src');
+   import mdns_tls as t; ..."`（见 `src/mdns_tls.py` 的 `generate_ca` / `generate_server_cert`）。
+3. **导入现有 PEM**：把已有证书/私钥放到配置指定路径即可；支持私有 CA 签发的证书链。
+
+启用后管理台与 HTTP 网关都改用 TLS；**需重启进程**才会切换监听协议（热重载只更新配置与 mDNS 记录）。
+证书缺失或格式错误时自动降级为 HTTP 并在日志中报错，不影响 mDNS 主服务。
+
+mDNS 服务发现：启用后发布 `_https._tcp.local`（PTR + SRV + TXT + A），
+TXT 中包含 `tls=1`、`version=<TLS 版本>`、`path=/`、`ca_fp=sha256:<CA 指纹>`，
+客户端可用该指纹做证书固定（certificate pinning）。
+CA 证书可通过公开的 `GET /api/tls/ca.pem`（或 `/ca.pem`）下载并安装到客户端信任库。
+
+**安全边界**：私钥权限自动设为 0600；CA 私钥仅签发时使用；`client_auth = "require"`
+可强制双向认证。自签证书仅适合内网，公网部署请使用受信任 CA 签发的证书。
+
+---
+
 ## 可观测增强
 
 纯可观测层（`src/mdns_insights.py`），零网络副作用，默认全开、热重载即时生效。
@@ -408,6 +447,9 @@ curl -s http://127.0.0.1:8765/api/metrics
 | GET | `/api/auth` | 管理员密码状态（是否启用 / 算法 / 更新时间） |
 | GET | `/api/config/history` | 配置版本列表 |
 | GET | `/api/alerts` | 告警编排器状态与统计 |
+| GET | `/api/tls/status` | TLS 状态：证书主体 / 有效期 / SHA-256 指纹 / 文件齐备情况 |
+| GET | `/api/tls/ca.pem`（或 `/ca.pem`） | 下载 CA 证书 PEM（**公开**，供客户端安装信任；不含私钥） |
+| POST | `/api/tls/generate` | 生成自签 CA + 服务器证书（**需密码**） |
 | POST | `/api/auth/password` | 首次设置 / 修改管理员密码（body `new_password`） |
 | POST | `/api/auth/verify` | 校验管理员密码 |
 | POST | `/api/config` | 保存配置（**需密码**，body `{raw}` 或 `{config}`） |
@@ -552,6 +594,7 @@ mdns-responder/
   config.example.toml   配置模板（入库）
   config.toml           实际运行配置（不入库，含本机 IP / token）
   auth.toml             管理员密码摘要（不入库，0600）
+  certs/                HTTPS 证书目录（不入库；ca.key / server.key 权限 0600）
   start.sh              统一启动入口（前台 / 后台 / 校验 / 自测 / 启停）
   install.sh            一键安装 / 升级脚本（curl | bash，--upgrade）
   Dockerfile            python:3.11-slim 零依赖镜像
@@ -561,6 +604,7 @@ mdns-responder/
     mdns_responder.py   核心：组播 socket + DNS 编解码 + 应答 + 热重载 + 运维装配
     mdns_insights.py    可观测层：健康探测 / 查询审计 / 服务浏览 / 名称冲突
     mdns_security.py    管理员密码（PBKDF2 加盐哈希）
+    mdns_tls.py         HTTPS/CA：自签证书签发、TLS 上下文、证书指纹与服务发布
     mdns_history.py     配置版本快照 / 列表 / 读回 / 有界淘汰
     mdns_alerts.py      告警 Webhook 编排（平台识别 / 冷却 / 重试）
     admin_server.py     Web 管理 API（ThreadingHTTPServer）+ 友好页 + 网关

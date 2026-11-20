@@ -12,6 +12,13 @@ config.toml
 auth.toml
 auth.toml.tmp
 
+# TLS 证书与私钥（含 CA 私钥，绝不入库）
+certs/
+*.key
+*.crt
+*.csr
+*.srl
+
 # install.sh --upgrade 的现场备份
 .upgrade-backup-*
 
