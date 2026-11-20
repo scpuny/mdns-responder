@@ -294,3 +294,51 @@ def tls_status(cfg: TLSConfig, base_dir: str) -> dict:
         "ca": cert_info(ca),
         "ready": cfg.enabled and os.path.isfile(cert) and os.path.isfile(key),
     }
+
+
+# ---------------------------------------------------------------------------
+# 多域名证书：同一个 CA 为每个 .local 域名签发独立服务器证书。
+# 供 Traefik / K3s Ingress 终结 TLS 使用：客户端只信任一次 CA，
+# 每个域名拿自己那张带正确 SAN 的证书。
+# ---------------------------------------------------------------------------
+
+DOMAIN_CERT_DIR = "certs/domains"      # 相对配置文件目录
+
+
+def domain_slug(domain: str) -> str:
+    """域名 -> 安全目录名（防路径穿越；保留可读的域名文本）。"""
+    s = re.sub(r"[^A-Za-z0-9._-]", "_", (domain or "").strip().lower()).strip("._")
+    return s or "domain"
+
+
+def domain_cert_paths(base_dir: str, domain: str) -> tuple[str, str, str]:
+    """返回 (cert, key, fullchain) 三个文件路径。"""
+    folder = os.path.join(resolve_path(DOMAIN_CERT_DIR, base_dir), domain_slug(domain))
+    return (os.path.join(folder, "server.crt"),
+            os.path.join(folder, "server.key"),
+            os.path.join(folder, "fullchain.pem"))
+
+
+def write_fullchain(cert_path: str, ca_cert_path: str, out_path: str) -> None:
+    """拼出 cert + CA 的证书链（Traefik / nginx / Ingress 常用）。"""
+    with open(cert_path, "r", encoding="utf-8") as fh:
+        cert = fh.read()
+    with open(ca_cert_path, "r", encoding="utf-8") as fh:
+        ca = fh.read()
+    _ensure_parent(out_path)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(cert.rstrip() + "\n" + ca.rstrip() + "\n")
+    os.chmod(out_path, 0o644)
+
+
+def issue_domain_cert(domain: str, names: list[str], ca_cert_path: str,
+                      ca_key_path: str, base_dir: str, *,
+                      days: int = DEFAULT_CERT_DAYS,
+                      cn: str | None = None) -> dict:
+    """用 CA 为单个域名签发独立证书（含 SAN），并生成 fullchain.pem。"""
+    cert, key, fullchain = domain_cert_paths(base_dir, domain)
+    info = generate_server_cert(cert, key, ca_cert_path, ca_key_path,
+                                common_name=cn or domain, names=names, days=days)
+    write_fullchain(cert, ca_cert_path, fullchain)
+    return {"domain": domain, "cert_file": cert, "key_file": key,
+            "fullchain_file": fullchain, "names": names, "certificate": info}

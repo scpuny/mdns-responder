@@ -1004,6 +1004,89 @@ service_host = "tls-test.local"
           "TLS 配置 TOML 往返一致")
 
 
+def tls_domains_features() -> None:
+    """多域名证书：域名推导 / 单域名签发 / SAN / 一键签发 / 证书链 / 下载路径。"""
+    print("\n[12] 多域名独立证书")
+    import tempfile
+    import mdns_tls
+    from mdns_responder import Responder
+
+    if not mdns_tls.openssl_available():
+        print("  (跳过：系统无 openssl)")
+        return
+
+    d = tempfile.mkdtemp(prefix="mdns-domains-test-")
+    cfg_path = os.path.join(d, "config.toml")
+    with open(cfg_path, "w", encoding="utf-8") as fh:
+        fh.write('''[server]
+interface = "0.0.0.0"
+port = 15961
+gateway_admin_host = "mdns.local"
+[[hosts]]
+name = "nas.local"
+ip = "172.15.120.195"
+[[services]]
+type = "_http._tcp.local"
+instance = "idgate"
+ip = "172.15.120.195"
+port = 80
+[[services]]
+type = "_http._tcp.local"
+instance = "spider"
+ip = "172.15.120.195"
+port = 32281
+[tls]
+enabled = false
+ca_days = 90
+cert_days = 30
+''')
+    r = Responder(cfg_path)
+    listing = r.tls_domains()
+    names = [x["domain"] for x in listing["domains"]]
+    check("idgate.local" in names and "spider.local" in names,
+          "从 services 的 instance 推导域名")
+    check("nas.local" in names, "从 hosts 推导域名")
+    check("mdns.local" in names, "纳入管理台域名")
+    idgate = next(x for x in listing["domains"] if x["domain"] == "idgate.local")
+    check("172.15.120.195" in idgate["suggested_names"],
+          "域名建议 SAN 含对应 IP")
+
+    # 单域名签发
+    res = r.tls_issue_domain({"domain": "idgate.local"})
+    check(res["ok"] and "DNS:idgate.local" in res["certificate"]["san"],
+          "单域名签发：证书 SAN 含该域名")
+    check("IP Address:172.15.120.195" in res["certificate"]["san"],
+          "单域名签发：证书 SAN 含该域名 IP")
+    check(res["has_chain"], "生成 fullchain.pem 证书链")
+
+    # 证书链完整：链文件包含服务器证书与 CA
+    crt, key, chain = mdns_tls.domain_cert_paths(d, "idgate.local")
+    check(os.path.isfile(crt) and os.path.isfile(key) and os.path.isfile(chain),
+          "证书 / 私钥 / 证书链三文件落盘")
+    with open(chain, "r", encoding="utf-8") as fh:
+        chain_text = fh.read()
+    check(chain_text.count("BEGIN CERTIFICATE") >= 2,
+          "fullchain 含服务器证书 + CA 两张证书")
+    check(oct(os.stat(key).st_mode & 0o777) == "0o600", "私钥权限 0600")
+
+    # 一键签发全部
+    allres = r.tls_issue_all({})
+    check(allres["issued"] == allres["total"] and allres["ok"],
+          "一键签发全部域名成功")
+    listing2 = r.tls_domains()
+    check(all(x["issued"] for x in listing2["domains"]),
+          "签发后所有域名状态为已签发")
+    check(listing2["ca_ready"], "CA 自动创建并就绪")
+
+    # 通配符域名被拒绝
+    try:
+        r.tls_issue_domain({"domain": "*.local"})
+        rejected = False
+    except ValueError:
+        rejected = True
+    check(rejected, "拒绝通配符域名（单域名证书不支持）")
+
+
 def _txt_offsets(rdata: bytes) -> list[int]:
     offsets: list[int] = []
     i = 0
@@ -1026,6 +1109,7 @@ def main() -> int:
     log_rotation()
     friendly_page()
     tls_features()
+    tls_domains_features()
     if not args.offline:
         e2e()
         verify_admin_api()

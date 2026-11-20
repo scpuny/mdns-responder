@@ -14,6 +14,7 @@ auth.toml.tmp
 
 # TLS 证书与私钥（含 CA 私钥，绝不入库）
 certs/
+*.fullchain.pem
 *.key
 *.crt
 *.csr

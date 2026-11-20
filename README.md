@@ -274,6 +274,25 @@ CA 证书可通过公开的 `GET /api/tls/ca.pem`（或 `/ca.pem`）下载并安
 **安全边界**：私钥权限自动设为 0600；CA 私钥仅签发时使用；`client_auth = "require"`
 可强制双向认证。自签证书仅适合内网，公网部署请使用受信任 CA 签发的证书。
 
+### 多域名独立证书（Traefik / K3s Ingress 终结 TLS）
+
+一个 CA 可为配置里的**每个域名签发独立证书**——客户端在浏览器/系统里只信任一次 CA，
+所有 `.local` 服务就都可信。域名自动从 `[[hosts]]` 的 `name`、`[[services]]` 的 `host`
+（缺省用 `instance.local`）以及 `gateway_admin_host` 推导，每份证书带自己域名 + 对应 IP 的 SAN。
+
+- 控制台：配置管理 → 「HTTPS / CA」→「域名证书」卡片，单域名签发/重签、一键签发全部。
+- 文件落盘在 `certs/domains/<域名>/`：`server.crt`、`server.key`、`fullchain.pem`（证书链）。
+- API：`GET /api/tls/domains` 列出域名与状态；`POST /api/tls/domains/issue`（body `domain`, 可选 `names`/`days`）、
+  `POST /api/tls/domains/issue-all` 签发；`GET /api/tls/domains/<slug>/{cert,fullchain,key}.pem` 下载
+  （cert/fullchain 公开，key 需管理员密码）。
+- 部署到 Traefik / Ingress 时用 `fullchain.pem` + `key.pem`；**这与 mDNS 的 SRV 端口无关**，
+  DNS 只负责把域名解析到入口 IP，TLS 在入口按 Host 头分发后终结。
+
+> 注意：这里的 HTTPS 监听开关 `[tls] enabled` 只作用于 mDNS Studio 自身的 8765/80 端口；
+> 给业务域名签发的证书是**独立文件**，供你在 Traefik / K3s 侧配置，两者互不影响。
+> 业务服务报"不安全"的根因是它自己的证书不被信任——用这里的 CA 给该域名签证书并部署、
+> 再把 CA 装进客户端信任库，才能消除告警。
+
 ---
 
 ## 可观测增强
@@ -450,6 +469,10 @@ curl -s http://127.0.0.1:8765/api/metrics
 | GET | `/api/tls/status` | TLS 状态：证书主体 / 有效期 / SHA-256 指纹 / 文件齐备情况 |
 | GET | `/api/tls/ca.pem`（或 `/ca.pem`） | 下载 CA 证书 PEM（**公开**，供客户端安装信任；不含私钥） |
 | POST | `/api/tls/generate` | 生成自签 CA + 服务器证书（**需密码**） |
+| GET | `/api/tls/domains` | 列出全部域名及各自证书状态 |
+| POST | `/api/tls/domains/issue` | 给单个域名签发证书（body `domain`，可选 `names`/`days`；需密码） |
+| POST | `/api/tls/domains/issue-all` | 一键签发全部域名证书（需密码） |
+| GET | `/api/tls/domains/<slug>/{cert,fullchain,key}.pem` | 下载域名证书 / 证书链（公开）/ 私钥（需密码） |
 | POST | `/api/auth/password` | 首次设置 / 修改管理员密码（body `new_password`） |
 | POST | `/api/auth/verify` | 校验管理员密码 |
 | POST | `/api/config` | 保存配置（**需密码**，body `{raw}` 或 `{config}`） |

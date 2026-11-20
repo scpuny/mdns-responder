@@ -1334,6 +1334,162 @@ class Responder:
             "status": tls_status(tls_cfg, base),
         }
 
+    def tls_domains(self) -> dict:
+        """列出配置里的全部域名及各自证书状态（hosts / services / 管理台）。
+
+        每个域名一份独立证书，同一个 CA 签发；客户端信任一次 CA 即可覆盖全部。
+        """
+        from mdns_tls import (resolve_path, cert_info, domain_cert_paths,
+                              domain_slug, openssl_available)
+
+        cfg = self.cfg
+        base = os.path.dirname(self.config_path)
+        tls_cfg = getattr(cfg, "tls", None)
+        if tls_cfg is None:
+            return {"openssl": openssl_available(), "ca_ready": False,
+                    "ca": {"available": False}, "domains": [],
+                    "note": "配置中缺少 [tls] 段"}
+
+        ca_cert = resolve_path(tls_cfg.ca_file, base)
+        ca_key = resolve_path(tls_cfg.ca_key_file, base)
+        ca_ready = os.path.isfile(ca_cert) and os.path.isfile(ca_key)
+
+        # 从配置推导候选域名：hosts 的 name、services 的 host/instance、管理台域名。
+        found: dict[str, dict] = {}
+
+        def add(domain: str, ip: str = "", source: str = "") -> None:
+            if not isinstance(domain, str) or not domain.strip():
+                return
+            d = domain.strip().lower().rstrip(".")
+            if not d or "*" in d:
+                return                                   # 通配符域名不适合单域名证书
+            entry = found.setdefault(d, {"ips": [], "sources": []})
+            if ip and ip not in entry["ips"]:
+                entry["ips"].append(ip)
+            if source and source not in entry["sources"]:
+                entry["sources"].append(source)
+
+        for h in cfg.hosts:
+            add(h.name, h.ip, "host")
+        for s in cfg.services:
+            host = (s.host or "").strip()
+            if host:
+                add(host, s.ip, "service:" + s.instance)
+            else:
+                # 没有显式 host 的服务：实例名本身常作域名（如 idgate.local）
+                add(s.instance if "." in s.instance else s.instance + ".local",
+                    s.ip, "service:" + s.instance)
+        admin_host = (cfg.server.gateway_admin_host or "").strip()
+        if admin_host:
+            add(admin_host, "", "gateway")
+
+        domains: list[dict] = []
+        for d in sorted(found):
+            meta = found[d]
+            crt, key, chain = domain_cert_paths(base, d)
+            info = cert_info(crt)
+            names = [d] + list(meta["ips"])
+            domains.append({
+                "domain": d,
+                "slug": domain_slug(d),
+                "ips": meta["ips"],
+                "sources": meta["sources"],
+                "suggested_names": names,
+                "issued": bool(info.get("available")) and not bool(info.get("expired")),
+                "cert": info,
+                "has_key": os.path.isfile(key),
+                "has_chain": os.path.isfile(chain),
+            })
+
+        ca_info = cert_info(ca_cert)
+        return {
+            "openssl": openssl_available(),
+            "ca_ready": ca_ready,
+            "ca": ca_info,
+            "ca_fingerprint": ca_info.get("fingerprint", ""),
+            "domains": domains,
+        }
+
+    def tls_issue_domain(self, payload: dict) -> dict:
+        """给单个域名签证书。payload: domain, names?(list|str), days?"""
+        from mdns_tls import (generate_ca, openssl_available, resolve_path,
+                              issue_domain_cert, cert_info, domain_slug,
+                              tls_status, DEFAULT_CA_CN)
+
+        if not openssl_available():
+            raise RuntimeError("未找到 openssl，无法签发证书")
+        tls_cfg = getattr(self.cfg, "tls", None)
+        if tls_cfg is None:
+            raise RuntimeError("配置中缺少 [tls] 段")
+        base = os.path.dirname(self.config_path)
+        ca_cert = resolve_path(tls_cfg.ca_file, base)
+        ca_key = resolve_path(tls_cfg.ca_key_file, base)
+
+        # CA 不存在则按需自动创建（首次使用零手工步骤）
+        if not (os.path.isfile(ca_cert) and os.path.isfile(ca_key)):
+            LOG.info("未发现 CA，自动创建: %s", ca_cert)
+            generate_ca(ca_cert, ca_key, cn=DEFAULT_CA_CN, days=tls_cfg.ca_days)
+
+        domain = str(payload.get("domain", "") or "").strip().lower().rstrip(".")
+        if not domain or "*" in domain:
+            raise ValueError("domain 必须是具体域名（不支持通配符）")
+
+        # SAN：优先用调用方给的 names，否则从配置推导（域名 + 对应 IP）
+        raw_names = payload.get("names")
+        if isinstance(raw_names, str):
+            names = [x.strip() for x in re.split(r"[,\s]+", raw_names) if x.strip()]
+        elif isinstance(raw_names, list):
+            names = [str(x).strip() for x in raw_names if str(x).strip()]
+        else:
+            names = []
+        if not names:
+            listing = self.tls_domains()
+            match = next((d for d in listing["domains"] if d["domain"] == domain), None)
+            names = list(match["suggested_names"]) if match else [domain]
+        if domain not in names:
+            names.insert(0, domain)
+
+        days = max(1, int(payload.get("days", tls_cfg.cert_days)))
+        days = min(days, max(1, tls_cfg.ca_days))       # 不得超过 CA 有效期
+        result = issue_domain_cert(domain, names, ca_cert, ca_key, base,
+                                   days=days, cn=domain)
+        LOG.info("已签发域名证书: %s (SAN=%s)", domain, ",".join(names))
+        return {
+            "ok": True,
+            "message": f"已为 {domain} 签发独立证书",
+            "domain": domain,
+            "slug": domain_slug(domain),
+            "names": names,
+            "certificate": result["certificate"],
+            "has_chain": os.path.isfile(result["fullchain_file"]),
+            "status": tls_status(tls_cfg, base),
+        }
+
+    def tls_issue_all(self, payload: dict) -> dict:
+        """一键为配置里的全部域名签发证书。"""
+        listing = self.tls_domains()
+        if not listing.get("openssl"):
+            raise RuntimeError("未找到 openssl，无法签发证书")
+        domains = listing["domains"]
+        if not domains:
+            return {"ok": True, "issued": 0, "results": []}
+        results: list[dict] = []
+        for item in domains:
+            try:
+                res = self.tls_issue_domain({
+                    "domain": item["domain"],
+                    "names": item["suggested_names"],
+                })
+                results.append({"domain": item["domain"], "ok": True,
+                                "fingerprint": res["certificate"].get("fingerprint", "")})
+            except Exception as exc:  # noqa: BLE001 - 单域名失败不影响其他
+                LOG.warning("域名 %s 签发失败: %s", item["domain"], exc)
+                results.append({"domain": item["domain"], "ok": False, "error": str(exc)})
+        ok_count = sum(1 for r in results if r["ok"])
+        return {"ok": ok_count == len(results), "issued": ok_count,
+                "total": len(results), "results": results,
+                "domains": self.tls_domains()["domains"]}
+
     def config_json(self) -> dict:
         with open(self.config_path, "r", encoding="utf-8") as fh:
             raw = fh.read()

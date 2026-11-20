@@ -44,6 +44,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import re
 import ssl
 import threading
 import time
@@ -834,9 +835,50 @@ class AdminHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_domain_file(self, slug: str, kind: str) -> None:
+        """下载某域名的证书文件：cert/fullchain 公开，key 需管理员密码。"""
+        from mdns_tls import resolve_path, domain_slug, domain_cert_paths
+        cfg = self.server.responder.cfg
+        tls_cfg = getattr(cfg, "tls", None)
+        base = os.path.dirname(cfg.path)
+        listing = self.server.responder.tls_domains()
+        match = next((d for d in listing.get("domains", [])
+                      if d["slug"] == slug), None)
+        if tls_cfg is None or match is None:
+            return self._json({"error": "未知域名", "slug": slug}, 404)
+        if kind == "key":
+            if not self._authorized():
+                return self._json({"error": "unauthorized", "hint": "需要 X-Admin-Token"}, 401)
+            if not self._require_admin():
+                return
+        crt, key, chain = domain_cert_paths(base, match["domain"])
+        target = {"cert": crt, "fullchain": chain, "key": key}.get(kind, "")
+        if not target or not os.path.isfile(target):
+            return self._friendly("notfound", domain=match["domain"] + "." + kind,
+                                  detail="该域名尚未签发证书")
+        try:
+            with open(target, "rb") as fh:
+                body = fh.read()
+        except OSError as exc:
+            return self._friendly("unreachable", domain=match["domain"], detail=_short_exc(exc))
+        fname = f"{domain_slug(match['domain'])}-{kind}.pem"
+        ctype = ("application/x-pem-file" if kind != "fullchain"
+                 else "application/x-pem-file")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
+        # 域名证书下载（cert/fullchain 公开供 Traefik 拉取；key 需管理员密码）
+        m = re.match(r"^/api/tls/domains/([^/]+)/(cert|fullchain|key)\.pem$", path)
+        if m:
+            return self._serve_domain_file(m.group(1), m.group(2))
         if path in ("/", "/index.html"):
             return self._page()
         if path.startswith("/go/"):
@@ -888,6 +930,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                                        "files": {}, "certificate": {"available": False},
                                        "ca": {"available": False}, "ready": False})
                 return self._json(tls_status(tls_cfg, os.path.dirname(cfg.path)))
+            if path == "/api/tls/domains":
+                return self._json(responder.tls_domains())
             # 未知路径：给友好 404 页，而不是让人头大的报错栈
             return self._friendly("notfound", domain=path,
                                  detail="管理控制台没有这个地址")
@@ -938,6 +982,14 @@ class AdminHandler(BaseHTTPRequestHandler):
                 if not self._require_admin():
                     return None
                 return self._json(responder.tls_generate(payload))
+            if path == "/api/tls/domains/issue":
+                if not self._require_admin():
+                    return None
+                return self._json(responder.tls_issue_domain(payload))
+            if path == "/api/tls/domains/issue-all":
+                if not self._require_admin():
+                    return None
+                return self._json(responder.tls_issue_all(payload))
             return self._json({"error": "not found", "path": path}, 404)
         except ValueError as exc:
             return self._json({"error": str(exc)}, 400)

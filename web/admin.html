@@ -458,7 +458,7 @@ const S = {
   demo:false, tab:'overview', theme:localStorage.getItem('mdns.theme')||'auto',
   token:localStorage.getItem('mdns.token')||'', status:null, config:null,
   adminPw:sessionStorage.getItem('mdns.adminpw')||'',
-  auth:null, history:null, alerts:null, tls:null,
+  auth:null, history:null, alerts:null, tls:null, tlsDomains:null,
   ifaceOptions:[], records:[], logs:[], probe:null,
   probeName:'_services._dns-sd._udp.local', probeType:'PTR', dirty:false, configMode:'form', configSubTab:'basic',
   typeFilter:'ALL', recordSearch:'', logLevel:'ALL', autoScroll:true, es:null,
@@ -607,8 +607,9 @@ async function refreshAll(){
     api('/api/auth').catch(function(){return {enabled:false};}),
     api('/api/config/history').catch(function(){return {enabled:false,items:[],count:0,limit:30};}),
     api('/api/alerts').catch(function(){return {enabled:false,webhooks:0,stats:{sent:0,failed:0}};}),
-    api('/api/tls/status').catch(function(){return {enabled:false,files:{},certificate:{},ca:{}};})]);
-  S.tls=tlsStatus;
+    api('/api/tls/status').catch(function(){return {enabled:false,files:{},certificate:{},ca:{}};}),
+    api('/api/tls/domains').catch(function(){return {domains:[],ca_ready:false};})]);
+  S.tls=tlsStatus;S.tlsDomains=tlsDomains;
   S.config=cfg;S.records=rec.items||[];S.logs=logs.items||[];
   S.ifaceOptions=(ifaces.items||[]).slice();
   S.health=health;S.queries=queries;S.browse=browse;S.conflicts=conflicts;
@@ -1009,8 +1010,41 @@ function viewTls(){
     '<a class="btn ghost" href="/api/tls/ca.pem" target="_blank" download="mdns-studio-ca.crt">'+icon('download',14)+' 下载 CA 证书</a></div>'+
     '<div style="margin-top:14px;padding:14px 16px;border-radius:14px;background:var(--bg-soft);border:1px solid var(--line-soft);font-size:11.5px;color:var(--ink-3);line-height:1.8">'+
     '签发使用系统 openssl（标准库仅负责 TLS 运行期）。启用 HTTPS 后需<b>重启进程</b>才会切换监听协议；热重载只更新配置与 mDNS 记录。客户端安装 CA 后即可信任本地证书，也可用 TXT 中的 <span class="mono">ca_fp</span> 做指纹固定。</div>';
+  const dl=S.tlsDomains||{domains:[],ca_ready:false,ca:{}};
+  const domains=dl.domains||[];
+  const caFp=dl.ca_fingerprint||(dl.ca&&dl.ca.fingerprint)||'';
+  const domainRows=domains.length?domains.map(function(x){
+    const fp=(x.cert&&x.cert.fingerprint||'').slice(0,16);
+    const san=(x.cert&&x.cert.san||'').replace(/DNS:|IP Address:/g,'');
+    const st=x.issued?'<span class="badge b-SRV">已签发</span>':'<span class="badge b-OTHER">未签发</span>';
+    const slug=encodeURIComponent(x.slug);
+    const dlBtns=x.issued?
+      '<a class="btn ghost" style="padding:4px 8px;font-size:10.5px" href="/api/tls/domains/'+slug+'/fullchain.pem" download>'+icon('download',12)+' 证书链</a>'+
+      '<button class="btn ghost" style="padding:4px 8px;font-size:10.5px" data-act="tls-domain-key" data-slug="'+slug+'">'+icon('download',12)+' 私钥</button>':'';
+    return '<tr>'+
+      '<td><div class="mono" style="font-weight:600">'+esc(x.domain)+'</div>'+
+        '<div style="font-size:10px;color:var(--ink-3)">'+esc((x.sources||[]).join(', '))+'</div></td>'+
+      '<td>'+st+'</td>'+
+      '<td class="mono" style="font-size:10.5px;color:var(--ink-3)">'+esc(san||'—')+'</td>'+
+      '<td class="mono" style="font-size:10.5px;color:var(--ink-3)">'+esc(fp||'—')+'</td>'+
+      '<td style="white-space:nowrap">'+
+        '<button class="btn ghost" style="padding:4px 8px;font-size:10.5px" data-act="tls-domain-issue" data-domain="'+esc(x.domain)+'">'+icon('refresh',12)+' '+(x.issued?'重签':'签发')+'</button>'+dlBtns+'</td></tr>';
+  }).join(''):'<tr><td colspan="5" style="color:var(--ink-3);font-size:11.5px">配置中没有可签发的域名。请先在「基本设置」添加 hosts / services。</td></tr>';
+  const domainBody='<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px">'+
+    '<div style="font-size:11.5px;color:var(--ink-3);line-height:1.7">同一个 CA 为每个域名签发独立证书，客户端<b>只需信任一次 CA</b>。'+
+    (caFp?'<br>CA 指纹 <span class="mono">'+esc(caFp.slice(0,32))+'…</span>':'')+'</div>'+
+    '<button class="btn" data-act="tls-domain-issue-all" '+(domains.length?'':'disabled')+'>'+icon('refresh',14)+' 一键签发全部 ('+domains.length+')</button></div>'+
+    '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11.5px">'+
+    '<thead><tr style="text-align:left;border-bottom:1px solid var(--line);color:var(--ink-3)">'+
+    '<th style="padding:7px 8px">域名</th><th style="padding:7px 8px">状态</th><th style="padding:7px 8px">SAN</th>'+
+    '<th style="padding:7px 8px">指纹</th><th style="padding:7px 8px">操作</th></tr></thead>'+
+    '<tbody>'+domainRows+'</tbody></table></div>'+
+    '<div style="margin-top:12px;padding:12px 14px;border-radius:12px;background:var(--bg-soft);border:1px solid var(--line-soft);font-size:11px;color:var(--ink-3);line-height:1.75">'+
+    '把 <span class="mono">fullchain.pem</span> 和 <span class="mono">key.pem</span> 部署到 Traefik / K3s Ingress 即可按域名终结 TLS；下载私钥需管理员密码。'+
+    '证书签发后无需重启；前端热重载会在下次刷新时更新状态。</div>';
   return card('HTTPS 与证书配置','证书路径相对配置文件目录；私钥权限自动设为 0600',form,'s12','d1')+
-         card('证书状态','当前证书链与 CA 指纹；签发/下载操作即时生效，启用开关需重启',statusBody,'s12','d2');
+         card('证书状态','当前证书链与 CA 指纹；签发/下载操作即时生效，启用开关需重启',statusBody,'s12','d2')+
+         card('域名证书','为每个 .local 域名签发独立证书（Traefik / Ingress 用）',domainBody,'s12','d3');
 }
 function viewConfig(){
   const c=(S.config&&S.config.config)||{server:{},hosts:[],services:[]};
@@ -1463,6 +1497,46 @@ async function generateTls(){
     toast(r.message+'（CA 指纹 '+String(r.ca&&r.ca.fingerprint||'').slice(0,12)+'…）','ok');
   }catch(e){toast('证书生成失败：'+e.message,'err');}
 }
+async function issueDomainCert(domain){
+  if(S.demo){toast('演示模式：不支持实际签发证书','info');return;}
+  if(!(await ensureAdminPassword()))return;
+  toast('正在为 '+domain+' 签发证书…','info');
+  try{
+    const r=await api('/api/tls/domains/issue',{method:'POST',body:JSON.stringify({domain:domain})});
+    S.tls=r.status;
+    S.tlsDomains=await api('/api/tls/domains').catch(function(){return S.tlsDomains;});
+    renderTab();
+    toast(r.message+'（SAN: '+r.names.join(', ')+'）','ok');
+  }catch(e){toast('签发失败：'+e.message,'err');}
+}
+async function downloadDomainKey(slug){
+  if(S.demo){toast('演示模式：不支持下载私钥','info');return;}
+  if(!(await ensureAdminPassword()))return;
+  try{
+    const headers={};
+    if(S.token)headers['X-Admin-Token']=S.token;
+    if(S.adminPw)headers['X-Admin-Password']=S.adminPw;
+    const res=await fetch(BASE+'/api/tls/domains/'+slug+'/key.pem',{headers:headers});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const blob=await res.blob();
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=slug+'-key.pem';
+    document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
+    toast('私钥已下载（请妥善保管）','ok');
+  }catch(e){toast('下载私钥失败：'+e.message,'err');}
+}
+async function issueAllDomainCerts(){
+  if(S.demo){toast('演示模式：不支持实际签发证书','info');return;}
+  if(!(await ensureAdminPassword()))return;
+  toast('正在批量签发域名证书…','info');
+  try{
+    const r=await api('/api/tls/domains/issue-all',{method:'POST',body:'{}'});
+    S.tlsDomains=await api('/api/tls/domains').catch(function(){return S.tlsDomains;});
+    S.tls=await api('/api/tls/status').catch(function(){return S.tls;});
+    renderTab();
+    toast('签发完成：'+r.issued+'/'+r.total+' 个域名','ok');
+  }catch(e){toast('批量签发失败：'+e.message,'err');}
+}
 async function runProbe(name,type){
   if(!name)return toast('请输入要查询的域名','err');
   S.probeName=name;S.probeType=type||'ANY';
@@ -1508,6 +1582,9 @@ document.addEventListener('click',function(e){
   else if(a==='toggle'){el.classList.toggle('on');markDirty();}
   else if(a==='tls-toggle'){el.classList.toggle('on');markDirty();}
   else if(a==='tls-generate')generateTls();
+  else if(a==='tls-domain-issue')issueDomainCert(el.dataset.domain);
+  else if(a==='tls-domain-issue-all')issueAllDomainCerts();
+  else if(a==='tls-domain-key')downloadDomainKey(el.dataset.slug);
   else if(a==='add-host')addRow('host');
   else if(a==='add-service')addRow('service');
   else if(a==='del-host')delRow('host',Number(el.dataset.idx));
